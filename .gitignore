@@ -1,6 +1,38 @@
+# Python caches and tooling
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local build state
+.venv/
+venv/
+.build-venv/
+.build-home/
+.codex-worktrees/
+.worktrees/
+
+# Packaging output
 build/
 dist/
+*.egg-info/
 *.spec
-.codex-worktrees/
+*.zip
+
+# Generated point-cloud output
+*_ds_*m.las
+*_crop.las
+*_split_left.las
+*_split_right.las
+*_grid_*x*_p*.las
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

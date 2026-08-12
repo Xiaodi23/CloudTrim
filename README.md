@@ -1,57 +1,98 @@
-# LAS 点云预处理工具
+# LasTool
 
-一个面向 Windows 的轻量桌面工具，用于处理 `.las` 点云文件。
+LasTool is a lightweight Windows desktop application for batch processing `.las` point clouds. It keeps the original LAS point format and attributes while providing a simple English-language interface for common preprocessing tasks.
 
-当前包含两个功能页：
+## Features
 
-- 批量降采样：按体素分辨率批量输出降采样结果
-- 分割 / 裁剪：在俯视图中手动框选裁剪或画直线分割
+- **Batch voxel downsampling** — keep the first point encountered in each 3D voxel.
+- **Polygon crop** — draw a polygon in a sampled XY top view and export all full-resolution points inside it.
+- **Line split** — draw a directed line and export the points on its left and right sides.
+- **Grid split** — divide the full bounds or a selected rectangle into a configurable row-by-column grid.
+- **Multi-file workflow** — preview and apply the same crop or split selection to several LAS files.
+- **Background processing** — keep the interface responsive and process independent files in parallel.
+- **Safe outputs** — never overwrite an existing result and remove incomplete files after failures.
 
-## 功能
+## Download and Use the Portable Version
 
-### 批量降采样
+1. Download `LasTool-windows-x64.zip` from the latest GitHub release.
+2. Extract the complete archive to a writable folder.
+3. Double-click `LasTool.exe` inside the extracted `LasTool` folder.
 
-- 支持将多个 `.las` 文件加入列表后批量处理
-- 支持输入降采样分辨率，例如 `0.2`
-- 输出文件自动写回原目录
-- 输出文件命名为 `原名_ds_0p2m.las`
-- 已存在同名结果时自动跳过
-- 默认使用后台线程处理，避免界面卡死
-- 安装 `tkinterdnd2` 后支持拖拽导入
+No Python installation is required. Keep the `_internal` folder next to `LasTool.exe`; it contains the portable runtime.
 
-### 分割 / 裁剪
+Windows SmartScreen may warn about unsigned community software. Review the release source and checksums before choosing **More info > Run anyway**.
 
-- 打开单个 `.las` 文件并生成 XY 顶视图预览
-- 预览采用抽样点显示，导出时仍基于全量点云
-- 框选裁剪：拖拽矩形后导出框内点云
-- 直线分割：点击两个点形成切分线，导出左右两侧点云
-- 输出保留原始 LAS 点属性与头信息
-- 输出命名固定为：
-  - `原名_crop.las`
-  - `原名_split_left.las`
-  - `原名_split_right.las`
-- 已存在同名输出时默认跳过，不覆盖
+## Run from Source
 
-## 运行源码
+Python 3.9 or later is required. On Windows:
 
 ```powershell
-python -m pip install -r requirements.txt
-$env:PYTHONPATH=".\src"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\lastool.exe
+```
+
+You can also run the repository entry point directly:
+
+```powershell
+$env:PYTHONPATH = ".\src"
 python .\main.py
 ```
 
-如果当前环境尚未安装 `tkinterdnd2`，工具仍可启动，但拖拽会退化为仅支持“添加文件”按钮导入。
+## Output Files
 
-## 打包 exe
+Results are written next to each input file. Existing outputs are skipped.
+
+| Operation | Output naming |
+| --- | --- |
+| Downsample at 0.2 m | `source_ds_0p2m.las` |
+| Polygon crop | `source_crop.las` |
+| Line split | `source_split_left.las`, `source_split_right.las` |
+| 2 x 4 grid split | `source_grid_2x4_p1.las` through `source_grid_2x4_p8.las` |
+
+Grid part numbers run from the top-left cell to the bottom-right cell, row by row.
+
+## Build the Portable ZIP
+
+The build script creates an isolated virtual environment so packages from a global Python or Anaconda installation are not collected into the application:
 
 ```powershell
-.\build_exe.ps1
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 ```
 
-打包完成后，程序位于 `dist\LasBatchDownsampler\LasBatchDownsampler.exe`。
+Expected outputs:
 
-## 说明
+- `dist\LasTool\LasTool.exe`
+- `dist\LasTool-windows-x64.zip`
 
-- 当前版本只支持 `.las` 输入与输出，不处理 `.laz`
-- 降采样时体素内保留首个命中的点，不做质心重采样
-- 分割 / 裁剪当前基于 XY 顶视图，不包含 3D 盒选或自由旋转
+The script removes its temporary virtual environment and PyInstaller work files after a successful build. Pass `-KeepBuildEnvironment` while iterating locally if you want to reuse the environment.
+
+GitHub Actions runs the tests on pushes and pull requests. Tags matching `v*` also build and publish the Windows archive.
+
+## Tests
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+The suite covers downsampling consistency and failure cleanup, output paths, input validation, preview sampling and coloring, combined previews, polygon crops, line splits, grid splits, and the English-only application UI rule.
+
+## Current Limitations
+
+- Only uncompressed `.las` files are supported; `.laz` is not yet supported.
+- Selection operates in an XY top view. There is no 3D box selection or free rotation.
+- Downsampling keeps the first point in each voxel rather than computing a centroid.
+- Downsampling reads in chunks, but its set of unique voxel keys can still grow with the data. Extremely large or very sparse clouds may require substantial memory.
+- Processing cannot currently be cancelled after it starts.
+- Outputs always go next to the input file and use a skip-if-existing policy.
+
+## Privacy and Repository Hygiene
+
+LasTool performs all point-cloud processing locally. It does not make network requests, collect telemetry, upload files, or require credentials. Generated LAS files, build folders, virtual environments, archives, caches, and machine-specific PyInstaller specifications are excluded from Git.
+
+Before publishing a fork, run the checks in [`docs/release-checklist.md`](docs/release-checklist.md) and inspect your Git history for personal names, email addresses, credentials, data files, and absolute local paths.
+
+## License
+
+LasTool is released under the [MIT License](LICENSE).

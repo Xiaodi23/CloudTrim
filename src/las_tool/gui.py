@@ -1,24 +1,31 @@
 from __future__ import annotations
 
-import base64
+import os
 import queue
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 
+import laspy
 import numpy as np
 
 from .downsample import DownsampleResult, downsample_las, validate_resolution
 from .split_crop import (
     Bounds2D,
     CropResult,
+    GridSelection,
+    GridSplitResult,
     LineSelection,
+    PolygonSelection,
     PreviewData,
     SplitResult,
+    combine_preview_data,
     crop_las,
+    grid_split_las,
     load_preview_data,
     split_las,
 )
@@ -36,7 +43,7 @@ except ImportError:
 @dataclass
 class FileItem:
     path: Path
-    status: str = "待处理"
+    status: str = "Pending"
 
 
 class LogMixin:
@@ -59,9 +66,11 @@ class DownsamplePage(ttk.Frame, LogMixin):
         self.event_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
 
         self.resolution_var = tk.StringVar(value="0.2")
-        self.status_var = tk.StringVar(value="准备就绪")
+        self.status_var = tk.StringVar(value="Ready")
         self.drag_hint_var = tk.StringVar(
-            value="可将 .las 文件拖入列表" if HAS_DND else "未检测到拖拽依赖，可用“添加文件”导入"
+            value="Drag .las files into the list"
+            if HAS_DND
+            else "Drag-and-drop is unavailable; use Add Files instead"
         )
 
         self._build_layout()
@@ -77,24 +86,28 @@ class DownsamplePage(ttk.Frame, LogMixin):
         top.grid(row=0, column=0, sticky="ew")
         top.columnconfigure(5, weight=1)
 
-        ttk.Label(top, text="分辨率 (m)").grid(row=0, column=0, sticky="w")
+        ttk.Label(top, text="Resolution (m)").grid(row=0, column=0, sticky="w")
         self.resolution_entry = ttk.Entry(top, textvariable=self.resolution_var, width=12)
         self.resolution_entry.grid(row=0, column=1, padx=(8, 16), sticky="w")
 
-        self.add_button = ttk.Button(top, text="添加文件", command=self.add_files)
+        self.add_button = ttk.Button(top, text="Add Files", command=self.add_files)
         self.add_button.grid(row=0, column=2, padx=(0, 8))
 
-        self.remove_button = ttk.Button(top, text="移除选中", command=self.remove_selected)
+        self.remove_button = ttk.Button(top, text="Remove Selected", command=self.remove_selected)
         self.remove_button.grid(row=0, column=3, padx=(0, 8))
 
-        self.clear_button = ttk.Button(top, text="清空列表", command=self.clear_files)
+        self.clear_button = ttk.Button(top, text="Clear List", command=self.clear_files)
         self.clear_button.grid(row=0, column=4, padx=(0, 8))
 
-        self.start_button = ttk.Button(top, text="开始处理", command=self.start_processing)
+        self.start_button = ttk.Button(top, text="Start", command=self.start_processing)
         self.start_button.grid(row=0, column=5, sticky="e")
 
         ttk.Label(top, textvariable=self.drag_hint_var, foreground="#4f6b7a").grid(
-            row=1, column=0, columnspan=6, sticky="w", pady=(8, 0)
+            row=1,
+            column=0,
+            columnspan=6,
+            sticky="w",
+            pady=(8, 0),
         )
 
         table_frame = ttk.Frame(self, padding=(12, 0, 12, 12))
@@ -104,9 +117,9 @@ class DownsamplePage(ttk.Frame, LogMixin):
 
         columns = ("name", "folder", "status")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="extended")
-        self.tree.heading("name", text="文件名")
-        self.tree.heading("folder", text="所在目录")
-        self.tree.heading("status", text="状态")
+        self.tree.heading("name", text="File")
+        self.tree.heading("folder", text="Folder")
+        self.tree.heading("status", text="Status")
         self.tree.column("name", width=260, anchor="w")
         self.tree.column("folder", width=460, anchor="w")
         self.tree.column("status", width=120, anchor="center")
@@ -116,7 +129,7 @@ class DownsamplePage(ttk.Frame, LogMixin):
         tree_scroll.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=tree_scroll.set)
 
-        log_frame = ttk.LabelFrame(self, text="运行日志", padding=12)
+        log_frame = ttk.LabelFrame(self, text="Activity Log", padding=12)
         log_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
@@ -133,12 +146,12 @@ class DownsamplePage(ttk.Frame, LogMixin):
 
     def _configure_drop(self) -> None:
         if not HAS_DND:
-            self.log("未安装 tkinterdnd2，拖拽暂不可用，可通过“添加文件”选择 .las 文件。")
+            self.log("Drag-and-drop is unavailable. Use Add Files to select .las files.")
             return
 
         self.tree.drop_target_register(DND_FILES)
         self.tree.dnd_bind("<<Drop>>", self._on_drop)
-        self.log("拖拽已启用，可将多个 .las 文件直接拖入列表。")
+        self.log("Drag-and-drop is enabled. Drop one or more .las files into the list.")
 
     def _on_drop(self, event) -> None:
         paths = [Path(item) for item in self.winfo_toplevel().tk.splitlist(event.data)]
@@ -146,7 +159,7 @@ class DownsamplePage(ttk.Frame, LogMixin):
 
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="选择 LAS 文件",
+            title="Select LAS Files",
             filetypes=[("LAS files", "*.las")],
             parent=self,
         )
@@ -159,7 +172,7 @@ class DownsamplePage(ttk.Frame, LogMixin):
         for raw_path in paths:
             path = Path(raw_path)
             if path.suffix.lower() != ".las":
-                self.log(f"已忽略非 LAS 文件: {path}")
+                self.log(f"Ignored non-LAS file: {path}")
                 continue
 
             normalized = str(path.resolve())
@@ -171,13 +184,13 @@ class DownsamplePage(ttk.Frame, LogMixin):
                 "",
                 "end",
                 iid=normalized,
-                values=(path.name, str(path.parent), "待处理"),
+                values=(path.name, str(path.parent), "Pending"),
             )
             added += 1
 
         if added:
-            self.status_var.set(f"已加入 {added} 个文件")
-            self.log(f"已加入 {added} 个 LAS 文件。")
+            self.status_var.set(f"Added {added} file(s)")
+            self.log(f"Added {added} LAS file(s).")
 
     def remove_selected(self) -> None:
         if self.processing:
@@ -187,7 +200,7 @@ class DownsamplePage(ttk.Frame, LogMixin):
             self.tree.delete(item_id)
             self.files.pop(item_id, None)
 
-        self.status_var.set(f"当前列表 {len(self.files)} 个文件")
+        self.status_var.set(f"{len(self.files)} file(s) in the list")
 
     def clear_files(self) -> None:
         if self.processing:
@@ -196,33 +209,33 @@ class DownsamplePage(ttk.Frame, LogMixin):
         for item_id in self.tree.get_children():
             self.tree.delete(item_id)
         self.files.clear()
-        self.status_var.set("列表已清空")
+        self.status_var.set("List cleared")
 
     def start_processing(self) -> None:
         if self.processing:
             return
 
         if not self.files:
-            messagebox.showwarning("没有文件", "请先加入至少一个 .las 文件。", parent=self)
+            messagebox.showwarning("No Files", "Add at least one .las file first.", parent=self)
             return
 
         try:
             resolution = validate_resolution(self.resolution_var.get())
         except ValueError as exc:
-            messagebox.showerror("分辨率无效", str(exc), parent=self)
+            messagebox.showerror("Invalid Resolution", str(exc), parent=self)
             return
 
         self.processing = True
         self._set_controls_enabled(False)
-        self.status_var.set("处理中...")
-        self.log(f"开始批量降采样，分辨率 {resolution} m。")
+        self.status_var.set("Processing...")
+        self.log(f"Starting batch downsampling at {resolution} m.")
 
         for item_id in self.tree.get_children():
-            self.tree.set(item_id, "status", "排队中")
+            self.tree.set(item_id, "status", "Queued")
 
         file_paths = [item.path for item in self.files.values()]
         self.worker_thread = threading.Thread(
-            target=self._worker_run,
+            target=self._worker_run_parallel,
             args=(file_paths, resolution),
             daemon=True,
         )
@@ -234,8 +247,8 @@ class DownsamplePage(ttk.Frame, LogMixin):
 
         for input_path in file_paths:
             item_id = str(input_path.resolve())
-            self.event_queue.put(("file_status", {"item_id": item_id, "status": "处理中"}))
-            self.event_queue.put(("log", {"message": f"开始处理 {input_path}"}))
+            self.event_queue.put(("file_status", {"item_id": item_id, "status": "Processing"}))
+            self.event_queue.put(("log", {"message": f"Processing {input_path}"}))
 
             try:
                 result = downsample_las(
@@ -246,16 +259,16 @@ class DownsamplePage(ttk.Frame, LogMixin):
                     ),
                 )
             except Exception as exc:  # noqa: BLE001
-                message = f"{input_path.name} 失败: {exc}"
-                self.event_queue.put(("file_status", {"item_id": item_id, "status": "失败"}))
+                message = f"{input_path.name} failed: {exc}"
+                self.event_queue.put(("file_status", {"item_id": item_id, "status": "Failed"}))
                 self.event_queue.put(("log", {"message": message}))
                 self.event_queue.put(("log", {"message": traceback.format_exc(limit=3)}))
             else:
                 if result.skipped:
-                    self.event_queue.put(("file_status", {"item_id": item_id, "status": "跳过"}))
+                    self.event_queue.put(("file_status", {"item_id": item_id, "status": "Skipped"}))
                     self.event_queue.put(("log", {"message": f"{input_path.name}: {result.message}"}))
                 else:
-                    self.event_queue.put(("file_status", {"item_id": item_id, "status": "成功"}))
+                    self.event_queue.put(("file_status", {"item_id": item_id, "status": "Completed"}))
                     self.event_queue.put(("log", {"message": self._format_result_message(result)}))
 
             completed += 1
@@ -265,11 +278,110 @@ class DownsamplePage(ttk.Frame, LogMixin):
 
         self.event_queue.put(("done", {}))
 
+    def _worker_run_parallel(self, file_paths: list[Path], resolution: float) -> None:
+        completed = 0
+        total_files = len(file_paths)
+        max_workers = self._worker_count(total_files)
+        progress_lock = threading.Lock()
+        point_counts: dict[str, int] = {}
+        file_progress: dict[str, int] = {}
+
+        for input_path in file_paths:
+            item_id = str(input_path.resolve())
+            file_progress[item_id] = 0
+            try:
+                point_counts[item_id] = self._read_point_count(input_path)
+            except Exception:
+                point_counts[item_id] = 0
+
+        total_points = sum(point_counts.values())
+        self.event_queue.put(
+            (
+                "parallel_started",
+                {"workers": max_workers, "total_files": total_files},
+            )
+        )
+
+        def make_progress_callback(item_id: str):
+            def progress(done: int, total: int) -> None:
+                with progress_lock:
+                    file_progress[item_id] = done
+                    aggregate_done = sum(file_progress.values())
+                self.event_queue.put(
+                    (
+                        "progress",
+                        {"item_id": item_id, "done": aggregate_done, "total": total_points or total},
+                    )
+                )
+
+            return progress
+
+        def process_one(input_path: Path) -> tuple[str, Path, DownsampleResult | None, str | None, str | None]:
+            item_id = str(input_path.resolve())
+            self.event_queue.put(("file_status", {"item_id": item_id, "status": "Processing"}))
+            self.event_queue.put(("log", {"message": f"Processing {input_path}"}))
+
+            try:
+                result = downsample_las(
+                    input_path,
+                    resolution,
+                    progress_callback=make_progress_callback(item_id),
+                )
+            except Exception as exc:  # noqa: BLE001
+                message = f"{input_path.name} failed: {exc}"
+                return item_id, input_path, None, message, traceback.format_exc(limit=3)
+
+            return item_id, input_path, result, None, None
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(process_one, input_path) for input_path in file_paths]
+
+            for future in as_completed(futures):
+                item_id, input_path, result, error_message, error_detail = future.result()
+                with progress_lock:
+                    if point_counts[item_id]:
+                        file_progress[item_id] = point_counts[item_id]
+                    aggregate_done = sum(file_progress.values())
+
+                self.event_queue.put(
+                    (
+                        "progress",
+                        {"item_id": item_id, "done": aggregate_done, "total": total_points},
+                    )
+                )
+
+                if result is None:
+                    self.event_queue.put(("file_status", {"item_id": item_id, "status": "Failed"}))
+                    self.event_queue.put(("log", {"message": error_message or f"{input_path.name} failed"}))
+                    if error_detail:
+                        self.event_queue.put(("log", {"message": error_detail}))
+                elif result.skipped:
+                    self.event_queue.put(("file_status", {"item_id": item_id, "status": "Skipped"}))
+                    self.event_queue.put(("log", {"message": f"{input_path.name}: {result.message}"}))
+                else:
+                    self.event_queue.put(("file_status", {"item_id": item_id, "status": "Completed"}))
+                    self.event_queue.put(("log", {"message": self._format_result_message(result)}))
+
+                completed += 1
+                self.event_queue.put(("batch_progress", {"completed": completed, "total_files": total_files}))
+
+        self.event_queue.put(("done", {}))
+
+    @staticmethod
+    def _worker_count(file_count: int) -> int:
+        cpu_count = os.cpu_count() or 1
+        return max(1, min(file_count, max(1, cpu_count - 1), 8))
+
+    @staticmethod
+    def _read_point_count(path: Path) -> int:
+        with laspy.open(path) as reader:
+            return int(reader.header.point_count)
+
     @staticmethod
     def _format_result_message(result: DownsampleResult) -> str:
         return (
-            f"{result.input_path.name}: {result.input_points:,} -> {result.output_points:,} 点，"
-            f"输出 {result.output_path.name}"
+            f"{result.input_path.name}: {result.input_points:,} -> {result.output_points:,} points, "
+            f"saved as {result.output_path.name}"
         )
 
     def _set_controls_enabled(self, enabled: bool) -> None:
@@ -296,46 +408,58 @@ class DownsamplePage(ttk.Frame, LogMixin):
     def _handle_event(self, event_name: str, payload: dict) -> None:
         if event_name == "file_status":
             self.tree.set(payload["item_id"], "status", payload["status"])
+        elif event_name == "parallel_started":
+            self.log(
+                f"Parallel downsampling: {payload['workers']} worker(s) for "
+                f"{payload['total_files']} file(s)."
+            )
         elif event_name == "progress":
             done = payload["done"]
             total = payload["total"]
             if total:
                 percent = done / total * 100
-                self.status_var.set(f"处理中 {percent:.1f}%")
+                self.status_var.set(f"Processing {percent:.1f}%")
         elif event_name == "batch_progress":
-            self.status_var.set(f"已完成 {payload['completed']} / {payload['total_files']} 个文件")
+            self.status_var.set(f"Completed {payload['completed']} / {payload['total_files']} file(s)")
         elif event_name == "log":
             self.log(payload["message"])
         elif event_name == "done":
             self.processing = False
             self._set_controls_enabled(True)
-            self.status_var.set("全部处理完成")
-            self.log("全部任务完成。")
+            self.status_var.set("All files completed")
+            self.log("Batch processing completed.")
 
 
 class SplitCropPage(ttk.Frame, LogMixin):
-    PREVIEW_LIMIT = 100_000
+    PREVIEW_LIMIT = 80_000
     PREVIEW_PADDING = 24
-    PREVIEW_BACKGROUND = np.array([248, 250, 252], dtype=np.uint8)
-    PREVIEW_POINT_COLOR = np.array([38, 57, 77], dtype=np.uint8)
+    PREVIEW_BACKGROUND = np.array([245, 247, 250], dtype=np.uint8)
 
     def __init__(self, parent: ttk.Notebook) -> None:
         super().__init__(parent, padding=0)
 
-        self.current_path: Path | None = None
+        self.current_paths: list[Path] = []
         self.preview_data: PreviewData | None = None
         self.mode_var = tk.StringVar(value="crop")
-        self.file_var = tk.StringVar(value="未加载文件")
-        self.hint_var = tk.StringVar(value="框选模式：在预览中拖拽一个矩形区域。")
-        self.status_var = tk.StringVar(value="打开一个 .las 文件后，就可以在顶视图中框选或划线。")
+        self.file_var = tk.StringVar(value="No files loaded")
+        self.hint_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(
+            value="Open or drop .las files to preview, crop, or split them."
+        )
+        self.grid_rows_var = tk.StringVar(value="2")
+        self.grid_cols_var = tk.StringVar(value="2")
 
         self.loading_preview = False
         self.processing = False
         self.event_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
 
-        self.crop_selection: Bounds2D | None = None
-        self.crop_anchor: tuple[float, float] | None = None
-        self.crop_drag_point: tuple[float, float] | None = None
+        self.crop_selection: PolygonSelection | None = None
+        self.crop_points: list[tuple[float, float]] = []
+        self.crop_hover_point: tuple[float, float] | None = None
+        self.grid_selection: Bounds2D | None = None
+        self.drag_anchor: tuple[float, float] | None = None
+        self.drag_point: tuple[float, float] | None = None
+        self.drag_mode: str | None = None
         self.split_points: list[tuple[float, float]] = []
 
         self.preview_photo: tk.PhotoImage | None = None
@@ -343,23 +467,25 @@ class SplitCropPage(ttk.Frame, LogMixin):
         self.transform: dict[str, float] | None = None
 
         self._build_layout()
+        self._configure_drop()
+        self._on_mode_change()
         self.after(100, self._drain_events)
 
     def _build_layout(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
         self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)
 
         top = ttk.Frame(self, padding=12)
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(7, weight=1)
+        top.columnconfigure(9, weight=1)
 
-        self.open_button = ttk.Button(top, text="打开 LAS", command=self.open_file)
+        self.open_button = ttk.Button(top, text="Open LAS", command=self.open_file)
         self.open_button.grid(row=0, column=0, padx=(0, 8))
 
         self.crop_radio = ttk.Radiobutton(
             top,
-            text="框选裁剪",
+            text="Polygon Crop",
             variable=self.mode_var,
             value="crop",
             command=self._on_mode_change,
@@ -368,28 +494,105 @@ class SplitCropPage(ttk.Frame, LogMixin):
 
         self.split_radio = ttk.Radiobutton(
             top,
-            text="直线分割",
+            text="Line Split",
             variable=self.mode_var,
             value="split",
             command=self._on_mode_change,
         )
         self.split_radio.grid(row=0, column=2, padx=(0, 8))
 
-        self.clear_selection_button = ttk.Button(top, text="清除选区", command=self.clear_selection)
-        self.clear_selection_button.grid(row=0, column=3, padx=(0, 8))
+        self.grid_radio = ttk.Radiobutton(
+            top,
+            text="Grid Split",
+            variable=self.mode_var,
+            value="grid",
+            command=self._on_mode_change,
+        )
+        self.grid_radio.grid(row=0, column=3, padx=(0, 8))
 
-        self.export_button = ttk.Button(top, text="执行导出", command=self.start_export)
-        self.export_button.grid(row=0, column=4, padx=(0, 8))
+        self.clear_selection_button = ttk.Button(
+            top, text="Clear Selection", command=self.clear_selection
+        )
+        self.clear_selection_button.grid(row=0, column=4, padx=(0, 8))
 
-        ttk.Label(top, text="当前文件:").grid(row=0, column=5, padx=(16, 8), sticky="w")
-        ttk.Label(top, textvariable=self.file_var).grid(row=0, column=6, columnspan=2, sticky="w")
+        self.remove_file_button = ttk.Button(
+            top, text="Remove Selected", command=self.remove_selected_files
+        )
+        self.remove_file_button.grid(row=0, column=5, padx=(0, 8))
+
+        self.clear_files_button = ttk.Button(
+            top, text="Clear Files", command=self.clear_loaded_files
+        )
+        self.clear_files_button.grid(row=0, column=6, padx=(0, 8))
+
+        self.export_button = ttk.Button(top, text="Export", command=self.start_export)
+        self.export_button.grid(row=0, column=7, padx=(0, 8))
+
+        ttk.Label(top, text="Current:").grid(row=0, column=8, padx=(16, 8), sticky="w")
+        ttk.Label(top, textvariable=self.file_var).grid(row=0, column=9, sticky="w")
 
         ttk.Label(top, textvariable=self.hint_var, foreground="#4f6b7a").grid(
-            row=1, column=0, columnspan=8, sticky="w", pady=(8, 0)
+            row=1,
+            column=0,
+            columnspan=10,
+            sticky="w",
+            pady=(8, 0),
         )
 
-        preview_frame = ttk.LabelFrame(self, text="俯视预览", padding=12)
-        preview_frame.grid(row=1, column=0, sticky="nsew", padx=12)
+        self.grid_controls = ttk.Frame(top)
+        self.grid_controls.grid(row=2, column=0, columnspan=10, sticky="w", pady=(10, 0))
+
+        ttk.Label(self.grid_controls, text="Rows").grid(row=0, column=0, sticky="w")
+        self.grid_rows_entry = ttk.Entry(self.grid_controls, textvariable=self.grid_rows_var, width=6)
+        self.grid_rows_entry.grid(row=0, column=1, padx=(6, 12))
+
+        ttk.Label(self.grid_controls, text="Columns").grid(row=0, column=2, sticky="w")
+        self.grid_cols_entry = ttk.Entry(self.grid_controls, textvariable=self.grid_cols_var, width=6)
+        self.grid_cols_entry.grid(row=0, column=3, padx=(6, 12))
+
+        self.grid_2x2_button = ttk.Button(
+            self.grid_controls,
+            text="2 x 2",
+            command=lambda: self._set_grid_preset(2, 2),
+        )
+        self.grid_2x2_button.grid(row=0, column=4, padx=(0, 8))
+
+        self.grid_2x4_button = ttk.Button(
+            self.grid_controls,
+            text="2 x 4",
+            command=lambda: self._set_grid_preset(2, 4),
+        )
+        self.grid_2x4_button.grid(row=0, column=5, padx=(0, 8))
+
+        ttk.Label(
+            self.grid_controls,
+            text=(
+                "Grid mode covers the full point cloud by default. "
+                "Drag a rectangle in the preview to limit the area."
+            ),
+            foreground="#4f6b7a",
+        ).grid(row=0, column=6, sticky="w", padx=(8, 0))
+
+        file_frame = ttk.LabelFrame(self, text="Loaded Files", padding=12)
+        file_frame.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        file_frame.columnconfigure(0, weight=1)
+
+        columns = ("name", "folder", "status")
+        self.file_tree = ttk.Treeview(file_frame, columns=columns, show="headings", selectmode="extended", height=4)
+        self.file_tree.heading("name", text="File")
+        self.file_tree.heading("folder", text="Folder")
+        self.file_tree.heading("status", text="Status")
+        self.file_tree.column("name", width=260, anchor="w")
+        self.file_tree.column("folder", width=560, anchor="w")
+        self.file_tree.column("status", width=100, anchor="center")
+        self.file_tree.grid(row=0, column=0, sticky="ew")
+
+        file_scroll = ttk.Scrollbar(file_frame, orient="vertical", command=self.file_tree.yview)
+        file_scroll.grid(row=0, column=1, sticky="ns")
+        self.file_tree.configure(yscrollcommand=file_scroll.set)
+
+        preview_frame = ttk.LabelFrame(self, text="Top View", padding=12)
+        preview_frame.grid(row=2, column=0, sticky="nsew", padx=12)
         preview_frame.columnconfigure(0, weight=1)
         preview_frame.rowconfigure(0, weight=1)
 
@@ -401,12 +604,14 @@ class SplitCropPage(ttk.Frame, LogMixin):
         )
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<Motion>", self._on_canvas_motion)
         self.canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self.canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
 
-        log_frame = ttk.LabelFrame(self, text="运行日志", padding=12)
-        log_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=12)
+        log_frame = ttk.LabelFrame(self, text="Activity Log", padding=12)
+        log_frame.grid(row=3, column=0, sticky="nsew", padx=12, pady=12)
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
 
@@ -418,103 +623,365 @@ class SplitCropPage(ttk.Frame, LogMixin):
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
         status_bar = ttk.Label(self, textvariable=self.status_var, anchor="w", relief="groove", padding=8)
-        status_bar.grid(row=3, column=0, sticky="ew")
+        status_bar.grid(row=4, column=0, sticky="ew")
+
+        self.grid_rows_var.trace_add("write", self._on_grid_value_change)
+        self.grid_cols_var.trace_add("write", self._on_grid_value_change)
+
+    def _configure_drop(self) -> None:
+        if not HAS_DND:
+            self.log("Drag-and-drop is unavailable. Use Open LAS to select files.")
+            return
+
+        self.canvas.drop_target_register(DND_FILES)
+        self.canvas.dnd_bind("<<Drop>>", self._on_preview_drop)
+        self.log("Drag-and-drop is enabled in the preview area.")
+
+    def _on_preview_drop(self, event) -> None:
+        paths = [Path(item) for item in self.winfo_toplevel().tk.splitlist(event.data)]
+        valid_paths = [path for path in paths if path.suffix.lower() == ".las"]
+        ignored_paths = [path for path in paths if path.suffix.lower() != ".las"]
+
+        for path in ignored_paths:
+            self.log(f"Ignored non-LAS file: {path}")
+
+        if not valid_paths:
+            self.status_var.set("No supported LAS files were found.")
+            return
+
+        self._start_preview_load([*self.current_paths, *valid_paths])
 
     def open_file(self) -> None:
         if self.loading_preview or self.processing:
             return
 
-        path = filedialog.askopenfilename(
-            title="选择 LAS 文件",
+        paths = filedialog.askopenfilenames(
+            title="Select LAS Files",
             filetypes=[("LAS files", "*.las")],
             parent=self,
         )
-        if path:
-            self._start_preview_load(Path(path))
+        if paths:
+            self._start_preview_load([Path(path) for path in paths])
 
-    def _start_preview_load(self, path: Path) -> None:
+    def _start_preview_load(self, paths: list[Path]) -> None:
+        normalized_paths = self._normalize_input_paths(paths)
+        if not normalized_paths:
+            return
+
         self.loading_preview = True
         self._set_controls_enabled(False)
-        self.status_var.set("正在加载预览...")
-        self.file_var.set(str(path))
-        self.log(f"开始加载预览: {path}")
+        self.status_var.set("Loading preview...")
+        self.file_var.set(self._format_file_label(normalized_paths))
+        self._sync_file_tree(normalized_paths, "Loading")
+        self.log(f"Loading a preview for {len(normalized_paths)} LAS file(s).")
+        for path in normalized_paths:
+            self.log(f"  - {path}")
 
-        thread = threading.Thread(target=self._load_preview_worker, args=(path,), daemon=True)
+        thread = threading.Thread(
+            target=self._load_preview_worker,
+            args=(normalized_paths,),
+            daemon=True,
+        )
         thread.start()
 
-    def _load_preview_worker(self, path: Path) -> None:
+    def _load_preview_worker(self, paths: list[Path]) -> None:
         try:
-            preview = load_preview_data(path, max_points=self.PREVIEW_LIMIT)
+            point_counts = [self._read_point_count(path) for path in paths]
+            total_points = sum(point_counts)
+            per_file_limit = max(1, self.PREVIEW_LIMIT // max(len(paths), 1))
+            previews: list[PreviewData] = []
+            completed_points = 0
+
+            for path, point_count in zip(paths, point_counts):
+                preview = load_preview_data(
+                    path,
+                    max_points=per_file_limit,
+                    progress_callback=lambda done, total, offset=completed_points, grand_total=total_points: self.event_queue.put(
+                        ("preview_progress", {"done": offset + done, "total": grand_total or total})
+                    ),
+                )
+                previews.append(preview)
+                completed_points += point_count
+
+            preview = combine_preview_data(previews, label_path=paths[0])
         except Exception as exc:  # noqa: BLE001
-            self.event_queue.put(("preview_error", (path, exc, traceback.format_exc(limit=3))))
+            self.event_queue.put(("preview_error", (paths, exc, traceback.format_exc(limit=3))))
         else:
-            self.event_queue.put(("preview_loaded", preview))
+            self.event_queue.put(("preview_loaded", {"preview": preview, "paths": paths}))
+
+    @staticmethod
+    def _normalize_input_paths(paths: list[Path]) -> list[Path]:
+        normalized: list[Path] = []
+        seen: set[str] = set()
+        for raw_path in paths:
+            if raw_path.suffix.lower() != ".las":
+                continue
+            resolved = str(raw_path.resolve())
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            normalized.append(raw_path)
+        return normalized
+
+    @staticmethod
+    def _format_file_label(paths: list[Path]) -> str:
+        if not paths:
+            return "No files loaded"
+        if len(paths) == 1:
+            return str(paths[0])
+        return f"{len(paths)} LAS files (first: {paths[0].name})"
+
+    def _sync_file_tree(self, paths: list[Path], status: str = "Loaded") -> None:
+        for item_id in self.file_tree.get_children():
+            self.file_tree.delete(item_id)
+
+        for path in paths:
+            item_id = str(path.resolve())
+            self.file_tree.insert(
+                "",
+                "end",
+                iid=item_id,
+                values=(path.name, str(path.parent), status),
+            )
+
+    @staticmethod
+    def _read_point_count(path: Path) -> int:
+        with laspy.open(path) as reader:
+            return int(reader.header.point_count)
 
     def clear_selection(self) -> None:
         if self.loading_preview or self.processing:
             return
 
-        self.crop_selection = None
-        self.crop_anchor = None
-        self.crop_drag_point = None
-        self.split_points = []
+        mode = self.mode_var.get()
+        self.drag_anchor = None
+        self.drag_point = None
+        self.drag_mode = None
+
+        if mode == "crop":
+            self.crop_selection = None
+            self.crop_points = []
+            self.crop_hover_point = None
+        elif mode == "grid":
+            self.grid_selection = None
+        else:
+            self.split_points = []
+
         self._update_mode_hint()
         self._draw_preview()
+
+    def remove_selected_files(self) -> None:
+        if self.loading_preview or self.processing:
+            return
+
+        selected_ids = set(self.file_tree.selection())
+        if not selected_ids:
+            self.status_var.set("Select one or more files to remove.")
+            return
+
+        remaining_paths = [
+            path
+            for path in self.current_paths
+            if str(path.resolve()) not in selected_ids
+        ]
+        removed_count = len(self.current_paths) - len(remaining_paths)
+
+        if not remaining_paths:
+            self.clear_loaded_files()
+            self.log(f"Removed {removed_count} file(s). No files remain loaded.")
+            self.status_var.set("Selected files removed. No files are loaded.")
+            return
+
+        self.log(
+            f"Removed {removed_count} file(s). Reloading the remaining "
+            f"{len(remaining_paths)} file(s)."
+        )
+        self._start_preview_load(remaining_paths)
+
+    def clear_loaded_files(self) -> None:
+        if self.loading_preview or self.processing:
+            return
+
+        had_files = bool(self.current_paths or self.preview_data is not None)
+        self.current_paths = []
+        self.preview_data = None
+        self.crop_selection = None
+        self.crop_points = []
+        self.crop_hover_point = None
+        self.grid_selection = None
+        self.split_points = []
+        self.drag_anchor = None
+        self.drag_point = None
+        self.drag_mode = None
+        self.file_var.set("No files loaded")
+        self._sync_file_tree([])
+        self._invalidate_preview_cache()
+        self._update_mode_hint()
+        self._draw_preview()
+
+        if had_files:
+            self.status_var.set("Loaded files cleared. Ready for a new batch.")
+            self.log("Cleared all files from the split/crop page.")
+        else:
+            self.status_var.set("No files are currently loaded.")
 
     def start_export(self) -> None:
         if self.loading_preview or self.processing:
             return
 
-        if self.preview_data is None or self.current_path is None:
-            messagebox.showwarning("没有文件", "请先打开一个 .las 文件。", parent=self)
+        if self.preview_data is None or not self.current_paths:
+            messagebox.showwarning("No Files", "Open or drop at least one .las file first.", parent=self)
             return
 
-        if self.mode_var.get() == "crop":
+        mode = self.mode_var.get()
+        if mode == "crop":
             selection = self.crop_selection
             if selection is None or not selection.is_valid():
-                messagebox.showwarning("缺少选区", "请先拖拽一个有效矩形。", parent=self)
+                messagebox.showwarning(
+                    "No Selection", "Draw and close a valid polygon first.", parent=self
+                )
                 return
-            worker = threading.Thread(target=self._crop_worker, args=(self.current_path, selection), daemon=True)
-        else:
+        elif mode == "split":
             selection = self._current_line_selection()
             if selection is None or not selection.is_valid():
-                messagebox.showwarning("缺少切分线", "请先点击两个点形成切分线。", parent=self)
+                messagebox.showwarning(
+                    "No Split Line", "Click two points to define a split line first.", parent=self
+                )
                 return
-            worker = threading.Thread(target=self._split_worker, args=(self.current_path, selection), daemon=True)
+        else:
+            try:
+                rows, cols = self._get_grid_shape()
+            except ValueError as exc:
+                messagebox.showerror("Invalid Grid", str(exc), parent=self)
+                return
+
+            bounds = self._grid_bounds_for_export()
+            selection = GridSelection(bounds=bounds, rows=rows, cols=cols)
+
+        worker = threading.Thread(
+            target=self._export_worker,
+            args=(list(self.current_paths), mode, selection),
+            daemon=True,
+        )
 
         self.processing = True
         self._set_controls_enabled(False)
-        self.status_var.set("正在导出...")
-        self.log(f"开始执行 {self._mode_label()}。")
+        self.status_var.set("Exporting...")
+        self.log(f"Starting {self._mode_label()} for {len(self.current_paths)} file(s).")
         worker.start()
 
-    def _crop_worker(self, path: Path, selection: Bounds2D) -> None:
+    def _export_worker(self, paths: list[Path], mode: str, selection: object) -> None:
         try:
-            result = crop_las(
-                path,
-                selection,
-                progress_callback=lambda done, total: self.event_queue.put(
-                    ("export_progress", {"done": done, "total": total})
-                ),
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.event_queue.put(("export_error", (exc, traceback.format_exc(limit=3))))
-        else:
-            self.event_queue.put(("crop_done", result))
+            point_counts = [self._read_point_count(path) for path in paths]
+            total_points = sum(point_counts)
+            max_workers = self._export_worker_count(len(paths))
+            progress_lock = threading.Lock()
+            file_progress = {str(path.resolve()): 0 for path in paths}
+            results_by_index: list[object | None] = [None] * len(paths)
+            completed_files = 0
 
-    def _split_worker(self, path: Path, selection: LineSelection) -> None:
-        try:
-            result = split_las(
-                path,
-                selection,
-                progress_callback=lambda done, total: self.event_queue.put(
-                    ("export_progress", {"done": done, "total": total})
-                ),
+            self.event_queue.put(
+                (
+                    "export_parallel_started",
+                    {"workers": max_workers, "total_files": len(paths)},
+                )
             )
+
+            def make_progress_callback(path: Path):
+                progress_key = str(path.resolve())
+
+                def progress(done: int, total: int) -> None:
+                    with progress_lock:
+                        file_progress[progress_key] = done
+                        aggregate_done = sum(file_progress.values())
+                    self.event_queue.put(
+                        (
+                            "export_progress",
+                            {
+                                "done": aggregate_done,
+                                "total": total_points or total,
+                                "path": str(path),
+                            },
+                        )
+                    )
+
+                return progress
+
+            def export_one(index: int, path: Path) -> tuple[int, object]:
+                result = self._export_single(
+                    path,
+                    mode,
+                    selection,
+                    make_progress_callback(path),
+                )
+                return index, result
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(export_one, file_index, path)
+                    for file_index, path in enumerate(paths)
+                ]
+
+                for future in as_completed(futures):
+                    file_index, result = future.result()
+                    results_by_index[file_index] = result
+                    completed_files += 1
+
+                    progress_key = str(paths[file_index].resolve())
+                    with progress_lock:
+                        file_progress[progress_key] = point_counts[file_index]
+                        aggregate_done = sum(file_progress.values())
+
+                    self.event_queue.put(
+                        (
+                            "export_progress",
+                            {
+                                "done": aggregate_done,
+                                "total": total_points,
+                                "path": str(paths[file_index]),
+                            },
+                        )
+                    )
+                    self.event_queue.put(
+                        (
+                            "export_file_complete",
+                            {
+                                "mode": mode,
+                                "result": result,
+                                "completed_files": completed_files,
+                                "total_files": len(paths),
+                            },
+                        )
+                    )
+
+            results = [result for result in results_by_index if result is not None]
+            if len(results) != len(paths):
+                raise RuntimeError("Some export tasks did not finish.")
         except Exception as exc:  # noqa: BLE001
             self.event_queue.put(("export_error", (exc, traceback.format_exc(limit=3))))
         else:
-            self.event_queue.put(("split_done", result))
+            self.event_queue.put(("export_batch_done", {"mode": mode, "results": results}))
+
+    @staticmethod
+    def _export_worker_count(file_count: int) -> int:
+        cpu_count = os.cpu_count() or 1
+        return max(1, min(file_count, max(1, cpu_count - 1), 8))
+
+    def _export_single(
+        self,
+        path: Path,
+        mode: str,
+        selection: object,
+        progress,
+    ) -> object:
+        if mode == "crop":
+            assert isinstance(selection, PolygonSelection)
+            return crop_las(path, selection, progress_callback=progress)
+        if mode == "split":
+            assert isinstance(selection, LineSelection)
+            return split_las(path, selection, progress_callback=progress)
+        assert isinstance(selection, GridSelection)
+        return grid_split_las(path, selection, progress_callback=progress)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
@@ -522,8 +989,15 @@ class SplitCropPage(ttk.Frame, LogMixin):
             self.open_button,
             self.crop_radio,
             self.split_radio,
+            self.grid_radio,
             self.clear_selection_button,
+            self.remove_file_button,
+            self.clear_files_button,
             self.export_button,
+            self.grid_rows_entry,
+            self.grid_cols_entry,
+            self.grid_2x2_button,
+            self.grid_2x4_button,
         ):
             widget.configure(state=state)
 
@@ -538,166 +1012,348 @@ class SplitCropPage(ttk.Frame, LogMixin):
             self.after(100, self._drain_events)
 
     def _handle_event(self, event_name: str, payload: object) -> None:
-        if event_name == "preview_loaded":
-            preview = payload
+        if event_name == "preview_progress":
+            assert isinstance(payload, dict)
+            total = payload["total"]
+            done = payload["done"]
+            if total:
+                self.status_var.set(f"Loading preview {done / total * 100:.1f}%")
+        elif event_name == "preview_loaded":
+            assert isinstance(payload, dict)
+            preview = payload["preview"]
+            paths = payload["paths"]
             assert isinstance(preview, PreviewData)
-            self.current_path = preview.input_path
+            assert isinstance(paths, list)
+            self.current_paths = paths
             self.preview_data = preview
             self.loading_preview = False
             self._set_controls_enabled(True)
             self._invalidate_preview_cache()
-            self.clear_selection()
+            self.crop_selection = None
+            self.crop_points = []
+            self.crop_hover_point = None
+            self.grid_selection = None
+            self.split_points = []
+            self.drag_anchor = None
+            self.drag_point = None
+            self.drag_mode = None
+            self.file_var.set(self._format_file_label(paths))
+            self._sync_file_tree(paths)
             self.status_var.set(
-                f"已加载 {preview.input_path.name}，原始点数 {preview.total_points:,}，可以开始操作。"
+                f"Loaded {len(paths)} file(s) with {preview.total_points:,} total points."
             )
             self.log(
-                f"预览已加载: {preview.input_path.name}，预览采样 {len(preview.preview_points):,} / {preview.total_points:,} 点。"
+                f"Preview loaded for {len(paths)} file(s): sampled "
+                f"{len(preview.preview_points):,} / {preview.total_points:,} points."
             )
+            self._update_mode_hint()
             self._draw_preview()
         elif event_name == "preview_error":
-            path, exc, detail = payload
+            paths, exc, detail = payload
             self.loading_preview = False
             self._set_controls_enabled(True)
-            self.status_var.set("预览加载失败")
-            self.log(f"加载预览失败: {path} ({exc})")
+            self.status_var.set("Preview failed to load")
+            self.file_var.set(self._format_file_label(self.current_paths))
+            self._sync_file_tree(self.current_paths)
+            self.log(f"Failed to load preview: {paths} ({exc})")
             self.log(detail)
-            messagebox.showerror("加载失败", str(exc), parent=self)
+            messagebox.showerror("Preview Error", str(exc), parent=self)
+        elif event_name == "export_parallel_started":
+            assert isinstance(payload, dict)
+            workers = payload["workers"]
+            total_files = payload["total_files"]
+            self.log(f"Parallel export: {workers} worker(s) for {total_files} file(s).")
         elif event_name == "export_progress":
             assert isinstance(payload, dict)
             done = payload["done"]
             total = payload["total"]
             if total:
-                self.status_var.set(f"正在导出 {done / total * 100:.1f}%")
-        elif event_name == "crop_done":
-            result = payload
-            assert isinstance(result, CropResult)
+                self.status_var.set(f"Exporting {done / total * 100:.1f}%")
+        elif event_name == "export_file_complete":
+            assert isinstance(payload, dict)
+            result = payload["result"]
+            completed_files = payload["completed_files"]
+            total_files = payload["total_files"]
+            self._log_export_result(result)
+            self.status_var.set(f"Completed {completed_files} / {total_files} file(s)")
+        elif event_name == "export_batch_done":
+            assert isinstance(payload, dict)
+            mode = payload["mode"]
+            results = payload["results"]
             self.processing = False
             self._set_controls_enabled(True)
-            if result.skipped:
-                self.status_var.set("输出已存在，已跳过")
-                self.log(result.message)
-            elif result.empty:
-                self.status_var.set("选区内没有点")
-                self.log(result.message)
-                messagebox.showinfo("空选区", result.message, parent=self)
-            else:
-                self.status_var.set("裁剪导出完成")
+            self.status_var.set(f"{self._mode_label()} completed for {len(results)} file(s)")
+            if mode == "grid":
+                written = 0
+                empty = 0
+                for result in results:
+                    assert isinstance(result, GridSplitResult)
+                    written += sum(1 for part in result.parts if not part.empty)
+                    empty += sum(1 for part in result.parts if part.empty)
                 self.log(
-                    f"{result.input_path.name}: {result.input_points:,} -> {result.output_points:,} 点，输出 {result.output_path.name}"
+                    f"Grid export summary: {written} partition file(s) written; "
+                    f"{empty} empty partition(s)."
                 )
-        elif event_name == "split_done":
-            result = payload
-            assert isinstance(result, SplitResult)
-            self.processing = False
-            self._set_controls_enabled(True)
-            if result.skipped:
-                self.status_var.set("输出已存在，已跳过")
-                self.log(result.message)
-            else:
-                self.status_var.set("分割导出完成")
-                self.log(
-                    f"{result.input_path.name}: left={result.left_points:,}, right={result.right_points:,}。{result.message}"
-                )
-                if result.empty_left or result.empty_right:
-                    messagebox.showinfo("分割结果", result.message, parent=self)
         elif event_name == "export_error":
             exc, detail = payload
             self.processing = False
             self._set_controls_enabled(True)
-            self.status_var.set("导出失败")
-            self.log(f"导出失败: {exc}")
+            self.status_var.set("Export failed")
+            self.log(f"Export failed: {exc}")
             self.log(detail)
-            messagebox.showerror("导出失败", str(exc), parent=self)
+            messagebox.showerror("Export Error", str(exc), parent=self)
+
+    def _log_export_result(self, result: object) -> None:
+        if isinstance(result, CropResult):
+            if result.skipped:
+                self.log(f"{result.input_path.name}: {result.message}")
+            elif result.empty:
+                self.log(f"{result.input_path.name}: {result.message}")
+            else:
+                self.log(
+                    f"{result.input_path.name}: {result.input_points:,} -> "
+                    f"{result.output_points:,} points, saved as {result.output_path.name}"
+                )
+            return
+
+        if isinstance(result, SplitResult):
+            self.log(
+                f"{result.input_path.name}: left={result.left_points:,}, "
+                f"right={result.right_points:,}. {result.message}"
+            )
+            return
+
+        if isinstance(result, GridSplitResult):
+            self.log(f"{result.input_path.name}: {result.message}")
 
     def _on_mode_change(self) -> None:
-        self.clear_selection()
+        self.drag_anchor = None
+        self.drag_point = None
+        self.drag_mode = None
+        self._update_mode_hint()
+        self._update_grid_controls()
+        self._draw_preview()
 
     def _update_mode_hint(self) -> None:
-        if self.mode_var.get() == "crop":
-            self.hint_var.set("框选模式：在预览中拖拽一个矩形区域。")
+        mode = self.mode_var.get()
+        if mode == "crop":
+            self.hint_var.set(
+                "Polygon crop: click to add vertices, then double-click or click the first "
+                "vertex to close the polygon."
+            )
             if self.crop_selection is None:
-                self.status_var.set("框选模式：拖拽矩形后导出框内点云。")
+                if self.crop_points:
+                    self.status_var.set(f"Polygon crop: {len(self.crop_points)} vertices added.")
+                else:
+                    self.status_var.set("Polygon crop: click to add vertices; double-click to close.")
             else:
-                self.status_var.set("矩形选区已就绪，可执行导出。")
-        else:
-            self.hint_var.set("直线分割模式：点击两个点，按第一点到第二点的方向区分左右侧。")
+                self.status_var.set("Polygon selection ready. Click Export to continue.")
+        elif mode == "split":
+            self.hint_var.set(
+                "Line split: click two points to define the line. Left and right follow "
+                "the direction from the first point to the second."
+            )
             if not self.split_points:
-                self.status_var.set("直线分割模式：点击第一个点。")
+                self.status_var.set("Line split: click the first point.")
             elif len(self.split_points) == 1:
-                self.status_var.set("已记录第一个点，请点击第二个点。")
+                self.status_var.set("First point added. Click the second point.")
             else:
-                self.status_var.set("切分线已就绪，可执行导出。")
+                self.status_var.set("Split line ready. Click Export to continue.")
+        else:
+            rows, cols = self._safe_grid_shape()
+            label = f"{rows} x {cols}" if rows is not None and cols is not None else "current settings"
+            self.hint_var.set(
+                "Grid split: use the full point-cloud bounds or drag a rectangle to limit the area."
+            )
+            if self.preview_data is None:
+                self.status_var.set("Grid split: load files to preview and export partitions.")
+            elif self.grid_selection is None:
+                self.status_var.set(f"Grid split: the full bounds will be divided into {label}.")
+            else:
+                self.status_var.set(f"Grid area ready. Export will create {label} partitions.")
+
+    def _update_grid_controls(self) -> None:
+        if self.mode_var.get() == "grid":
+            self.grid_controls.grid()
+        else:
+            self.grid_controls.grid_remove()
+
+    def _set_grid_preset(self, rows: int, cols: int) -> None:
+        self.grid_rows_var.set(str(rows))
+        self.grid_cols_var.set(str(cols))
+
+    def _on_grid_value_change(self, *_args) -> None:
+        if self.mode_var.get() == "grid":
+            self._update_mode_hint()
+            self._draw_preview()
 
     def _on_canvas_configure(self, _event) -> None:
         self._invalidate_preview_cache()
         self._draw_preview()
 
+    def _on_canvas_motion(self, event) -> None:
+        if (
+            self.preview_data is None
+            or self.loading_preview
+            or self.processing
+            or self.mode_var.get() != "crop"
+            or self.crop_selection is not None
+            or not self.crop_points
+        ):
+            return
+
+        point = self._canvas_to_data(event.x, event.y)
+        if point is None:
+            return
+
+        self.crop_hover_point = point
+        self._draw_preview()
+
     def _on_canvas_press(self, event) -> None:
         if self.preview_data is None or self.loading_preview or self.processing:
             return
-        if self.mode_var.get() != "crop":
-            return
+
+        mode = self.mode_var.get()
 
         point = self._canvas_to_data(event.x, event.y)
         if point is None:
             return
 
-        self.crop_anchor = point
-        self.crop_drag_point = point
-        self.crop_selection = None
-        self.status_var.set("正在框选...")
+        if mode == "crop":
+            self._handle_crop_click(event.x, event.y, point)
+            return
+
+        if mode != "grid":
+            return
+
+        self.drag_anchor = point
+        self.drag_point = point
+        self.drag_mode = mode
+        self.status_var.set("Selecting area...")
         self._draw_preview()
 
-    def _on_canvas_drag(self, event) -> None:
-        if self.preview_data is None or self.mode_var.get() != "crop" or self.crop_anchor is None:
+    def _on_canvas_double_click(self, event) -> None:
+        if (
+            self.preview_data is None
+            or self.loading_preview
+            or self.processing
+            or self.mode_var.get() != "crop"
+        ):
             return
 
         point = self._canvas_to_data(event.x, event.y)
         if point is None:
             return
 
-        self.crop_drag_point = point
+        if self.crop_selection is not None:
+            self.crop_selection = None
+            self.crop_points = []
+        self._finish_crop_polygon(point)
+
+    def _on_canvas_drag(self, event) -> None:
+        if (
+            self.preview_data is None
+            or self.drag_anchor is None
+            or self.drag_mode != "grid"
+        ):
+            return
+
+        point = self._canvas_to_data(event.x, event.y)
+        if point is None:
+            return
+
+        self.drag_point = point
         self._draw_preview()
 
     def _on_canvas_release(self, event) -> None:
         if self.preview_data is None or self.loading_preview or self.processing:
             return
 
+        mode = self.mode_var.get()
         point = self._canvas_to_data(event.x, event.y)
         if point is None:
             return
 
-        if self.mode_var.get() == "crop":
-            if self.crop_anchor is None:
-                return
-            candidate = Bounds2D.from_points(self.crop_anchor, point)
-            self.crop_anchor = None
-            self.crop_drag_point = None
+        if mode == "grid" and self.drag_anchor is not None and self.drag_mode == mode:
+            candidate = Bounds2D.from_points(self.drag_anchor, point)
+            self.drag_anchor = None
+            self.drag_point = None
+            self.drag_mode = None
+
             if candidate.is_valid():
-                self.crop_selection = candidate
-                self.status_var.set("矩形选区已就绪，可执行导出。")
+                self.grid_selection = candidate
+                self.status_var.set("Grid area ready. Click Export to continue.")
             else:
-                self.crop_selection = None
-                self.status_var.set("选区太小，请重新拖拽一个矩形。")
+                self.status_var.set("The selected area is too small. Drag a larger rectangle.")
+            self._update_mode_hint()
             self._draw_preview()
+            return
+
+        if mode != "split":
             return
 
         if len(self.split_points) >= 2:
             self.split_points = [point]
-            self.status_var.set("已重置切分线，请点击第二个点。")
+            self.status_var.set("Split line reset. Click the second point.")
         else:
             self.split_points.append(point)
             if len(self.split_points) == 1:
-                self.status_var.set("已记录第一个点，请点击第二个点。")
+                self.status_var.set("First point added. Click the second point.")
             else:
                 selection = self._current_line_selection()
                 if selection is not None and selection.is_valid():
-                    self.status_var.set("切分线已就绪，可执行导出。")
+                    self.status_var.set("Split line ready. Click Export to continue.")
                 else:
                     self.split_points = []
-                    self.status_var.set("两个点过于接近，请重新选择。")
-                    messagebox.showwarning("切分线无效", "两个点过于接近，请重新选择。", parent=self)
+                    self.status_var.set("The two points are too close. Try again.")
+                    messagebox.showwarning(
+                        "Invalid Split Line", "The two points are too close. Try again.", parent=self
+                    )
         self._draw_preview()
+
+    def _handle_crop_click(self, canvas_x: float, canvas_y: float, point: tuple[float, float]) -> None:
+        if self.crop_selection is not None:
+            self.crop_selection = None
+            self.crop_points = [point]
+            self.crop_hover_point = point
+            self.status_var.set("Started a new polygon. Continue adding vertices.")
+            self._draw_preview()
+            return
+
+        if len(self.crop_points) >= 3 and self._is_near_crop_start(canvas_x, canvas_y):
+            self._finish_crop_polygon()
+            return
+
+        self.crop_points.append(point)
+        self.crop_hover_point = point
+        self.status_var.set(f"Added {len(self.crop_points)} polygon vertices.")
+        self._draw_preview()
+
+    def _finish_crop_polygon(self, point: tuple[float, float] | None = None) -> None:
+        if point is not None and (not self.crop_points or point != self.crop_points[-1]):
+            self.crop_points.append(point)
+
+        if len(self.crop_points) < 3:
+            self.status_var.set("A polygon needs at least three vertices.")
+            self._draw_preview()
+            return
+
+        selection = PolygonSelection(points=tuple(self.crop_points))
+        if selection.is_valid():
+            self.crop_selection = selection
+            self.crop_points = list(selection.points)
+            self.crop_hover_point = None
+            self.status_var.set("Polygon closed. Click Export to continue.")
+        else:
+            self.crop_selection = None
+            self.status_var.set("The polygon is invalid. Draw it again.")
+        self._draw_preview()
+
+    def _is_near_crop_start(self, canvas_x: float, canvas_y: float) -> bool:
+        if not self.crop_points:
+            return False
+        start_x, start_y = self._data_to_canvas(*self.crop_points[0])
+        return (start_x - canvas_x) ** 2 + (start_y - canvas_y) ** 2 <= 64.0
 
     def _current_line_selection(self) -> LineSelection | None:
         if len(self.split_points) != 2:
@@ -719,7 +1375,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
             self.canvas.create_text(
                 width / 2,
                 height / 2,
-                text="打开一个 .las 文件后，这里会显示俯视预览。",
+                text="Open or drop .las files to display a top-view preview.",
                 fill="#5c7080",
             )
             return
@@ -769,51 +1425,155 @@ class SplitCropPage(ttk.Frame, LogMixin):
         image[:, :] = self.PREVIEW_BACKGROUND
 
         points = self.preview_data.preview_points
+        colors = self.preview_data.preview_colors
         if points.size:
             xs, ys = self._data_to_canvas_arrays(points[:, 0], points[:, 1])
             xi = np.clip(np.rint(xs).astype(np.int64), 0, width - 1)
             yi = np.clip(np.rint(ys).astype(np.int64), 0, height - 1)
-            image[yi, xi] = self.PREVIEW_POINT_COLOR
+            image[yi, xi] = colors
 
-            for dx, dy in ((1, 0), (0, 1)):
+            for dx, dy in ((1, 0), (0, 1), (1, 1)):
                 nx = np.clip(xi + dx, 0, width - 1)
                 ny = np.clip(yi + dy, 0, height - 1)
-                image[ny, nx] = self.PREVIEW_POINT_COLOR
+                image[ny, nx] = colors
 
         ppm_header = f"P6 {width} {height} 255\n".encode("ascii")
         ppm_bytes = ppm_header + image.tobytes()
-        encoded = base64.b64encode(ppm_bytes).decode("ascii")
-        return tk.PhotoImage(data=encoded, format="PPM")
+        return tk.PhotoImage(data=ppm_bytes, format="PPM")
 
     def _draw_overlays(self) -> None:
-        preview_bounds = self._active_crop_bounds()
-        if preview_bounds is not None:
-            left, top = self._data_to_canvas(preview_bounds.min_x, preview_bounds.max_y)
-            right, bottom = self._data_to_canvas(preview_bounds.max_x, preview_bounds.min_y)
-            self.canvas.create_rectangle(
-                left,
-                top,
-                right,
-                bottom,
+        mode = self.mode_var.get()
+
+        if mode == "crop":
+            self._draw_crop_overlay()
+        elif mode == "split":
+            self._draw_line_overlay()
+        else:
+            bounds = self._active_grid_bounds()
+            if bounds is not None:
+                self._draw_bounds_outline(bounds, outline="#2563eb")
+                self._draw_grid_overlay(bounds)
+
+    def _draw_bounds_outline(self, bounds: Bounds2D, *, outline: str) -> None:
+        left, top = self._data_to_canvas(bounds.min_x, bounds.max_y)
+        right, bottom = self._data_to_canvas(bounds.max_x, bounds.min_y)
+        self.canvas.create_rectangle(
+            left,
+            top,
+            right,
+            bottom,
+            outline=outline,
+            width=2,
+            dash=(6, 4),
+        )
+
+    def _draw_crop_overlay(self) -> None:
+        points = self.crop_points if self.crop_points else []
+        if self.crop_selection is not None:
+            points = list(self.crop_selection.points)
+
+        if not points:
+            return
+
+        canvas_points = [self._data_to_canvas(x, y) for x, y in points]
+        flat_points = [value for point in canvas_points for value in point]
+
+        if len(canvas_points) >= 2:
+            self.canvas.create_line(*flat_points, fill="#0f766e", width=2)
+
+        if self.crop_selection is not None and len(canvas_points) >= 3:
+            self.canvas.create_polygon(
+                *flat_points,
                 outline="#0f766e",
+                fill="",
                 width=2,
-                dash=(6, 4),
             )
+        elif self.crop_hover_point is not None:
+            hover_x, hover_y = self._data_to_canvas(*self.crop_hover_point)
+            last_x, last_y = canvas_points[-1]
+            self.canvas.create_line(last_x, last_y, hover_x, hover_y, fill="#0f766e", dash=(4, 4), width=1)
 
-        if self.mode_var.get() == "split":
-            if self.split_points:
-                x1, y1 = self._data_to_canvas(*self.split_points[0])
-                self.canvas.create_oval(x1 - 4, y1 - 4, x1 + 4, y1 + 4, fill="#b45309", outline="")
-            if len(self.split_points) == 2:
-                x1, y1 = self._data_to_canvas(*self.split_points[0])
-                x2, y2 = self._data_to_canvas(*self.split_points[1])
-                self.canvas.create_line(x1, y1, x2, y2, fill="#b45309", width=2, dash=(8, 4))
-                self.canvas.create_oval(x2 - 4, y2 - 4, x2 + 4, y2 + 4, fill="#b45309", outline="")
+        for index, (x, y) in enumerate(canvas_points):
+            radius = 4 if index else 5
+            color = "#0f766e" if index else "#b45309"
+            self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, fill=color, outline="")
 
-    def _active_crop_bounds(self) -> Bounds2D | None:
-        if self.crop_anchor is not None and self.crop_drag_point is not None:
-            return Bounds2D.from_points(self.crop_anchor, self.crop_drag_point)
-        return self.crop_selection
+    def _draw_line_overlay(self) -> None:
+        if self.split_points:
+            x1, y1 = self._data_to_canvas(*self.split_points[0])
+            self.canvas.create_oval(x1 - 4, y1 - 4, x1 + 4, y1 + 4, fill="#b45309", outline="")
+        if len(self.split_points) == 2:
+            x1, y1 = self._data_to_canvas(*self.split_points[0])
+            x2, y2 = self._data_to_canvas(*self.split_points[1])
+            self.canvas.create_line(x1, y1, x2, y2, fill="#b45309", width=2, dash=(8, 4))
+            self.canvas.create_oval(x2 - 4, y2 - 4, x2 + 4, y2 + 4, fill="#b45309", outline="")
+
+    def _draw_grid_overlay(self, bounds: Bounds2D) -> None:
+        rows, cols = self._safe_grid_shape()
+        if rows is None or cols is None or rows <= 0 or cols <= 0:
+            return
+
+        width = bounds.max_x - bounds.min_x
+        height = bounds.max_y - bounds.min_y
+        if width <= 0 or height <= 0:
+            return
+
+        cell_width = width / cols
+        cell_height = height / rows
+        line_color = "#2563eb"
+        label_color = "#0f172a"
+        shadow_color = "#f8fafc"
+
+        for col in range(1, cols):
+            x = bounds.min_x + cell_width * col
+            x1, y1 = self._data_to_canvas(x, bounds.max_y)
+            x2, y2 = self._data_to_canvas(x, bounds.min_y)
+            self.canvas.create_line(x1, y1, x2, y2, fill=line_color, dash=(4, 4), width=1)
+
+        for row in range(1, rows):
+            y = bounds.min_y + cell_height * row
+            x1, y1 = self._data_to_canvas(bounds.min_x, y)
+            x2, y2 = self._data_to_canvas(bounds.max_x, y)
+            self.canvas.create_line(x1, y1, x2, y2, fill=line_color, dash=(4, 4), width=1)
+
+        label_number = 1
+        for row in range(rows):
+            y_top = bounds.max_y - row * cell_height
+            y_bottom = y_top - cell_height
+            for col in range(cols):
+                x_left = bounds.min_x + col * cell_width
+                x_right = x_left + cell_width
+                center_x = (x_left + x_right) / 2
+                center_y = (y_top + y_bottom) / 2
+                canvas_x, canvas_y = self._data_to_canvas(center_x, center_y)
+                self._draw_shadow_text(canvas_x, canvas_y, f"p{label_number}", label_color, shadow_color)
+                label_number += 1
+
+    def _draw_shadow_text(
+        self,
+        x: float,
+        y: float,
+        text: str,
+        fill: str,
+        shadow_fill: str,
+    ) -> None:
+        self.canvas.create_text(x + 1, y + 1, text=text, fill=shadow_fill, font=("Segoe UI", 11, "bold"))
+        self.canvas.create_text(x, y, text=text, fill=fill, font=("Segoe UI", 11, "bold"))
+
+    def _active_grid_bounds(self) -> Bounds2D | None:
+        if self.preview_data is None:
+            return None
+        if self.drag_mode == "grid" and self.drag_anchor is not None and self.drag_point is not None:
+            return Bounds2D.from_points(self.drag_anchor, self.drag_point)
+        if self.grid_selection is not None:
+            return self.grid_selection
+        return self.preview_data.bounds
+
+    def _grid_bounds_for_export(self) -> Bounds2D:
+        bounds = self._active_grid_bounds()
+        if bounds is None or not bounds.is_valid():
+            raise ValueError("The grid area is invalid.")
+        return bounds
 
     def _data_to_canvas_arrays(self, xs: np.ndarray, ys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         assert self.transform is not None
@@ -840,17 +1600,41 @@ class SplitCropPage(ttk.Frame, LogMixin):
         y = min(max(y, self.transform["min_y"]), self.transform["max_y"])
         return (x, y)
 
+    def _get_grid_shape(self) -> tuple[int, int]:
+        try:
+            rows = int(self.grid_rows_var.get())
+            cols = int(self.grid_cols_var.get())
+        except ValueError as exc:
+            raise ValueError("Rows and columns must be integers.") from exc
+
+        if rows <= 0 or cols <= 0:
+            raise ValueError("Rows and columns must be greater than 0.")
+        if rows * cols > 64:
+            raise ValueError("The number of grid partitions cannot exceed 64.")
+        return rows, cols
+
+    def _safe_grid_shape(self) -> tuple[int | None, int | None]:
+        try:
+            return self._get_grid_shape()
+        except ValueError:
+            return (None, None)
+
     def _mode_label(self) -> str:
-        return "框选裁剪" if self.mode_var.get() == "crop" else "直线分割"
+        mode = self.mode_var.get()
+        if mode == "crop":
+            return "Polygon crop"
+        if mode == "split":
+            return "Line split"
+        return "Grid split"
 
 
 class LasToolApp:
     def __init__(self) -> None:
         root_class = TkinterDnD.Tk if HAS_DND else tk.Tk
         self.root = root_class()
-        self.root.title("LAS 点云预处理工具")
-        self.root.geometry("1100x760")
-        self.root.minsize(860, 600)
+        self.root.title("LasTool - Point Cloud Batch Processor")
+        self.root.geometry("1180x820")
+        self.root.minsize(900, 620)
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True)
@@ -858,8 +1642,8 @@ class LasToolApp:
         self.downsample_page = DownsamplePage(notebook)
         self.split_crop_page = SplitCropPage(notebook)
 
-        notebook.add(self.downsample_page, text="批量降采样")
-        notebook.add(self.split_crop_page, text="分割 / 裁剪")
+        notebook.add(self.downsample_page, text="Batch Downsample")
+        notebook.add(self.split_crop_page, text="Split / Crop")
 
     def run(self) -> None:
         self.root.mainloop()

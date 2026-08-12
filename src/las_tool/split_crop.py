@@ -12,6 +12,7 @@ import numpy as np
 
 
 ProgressCallback = Callable[[int, int], None]
+PreviewProgressCallback = Callable[[int, int], None]
 
 
 @dataclass(frozen=True)
@@ -52,11 +53,46 @@ class LineSelection:
 
 
 @dataclass(frozen=True)
+class PolygonSelection:
+    points: tuple[tuple[float, float], ...]
+
+    def is_valid(self) -> bool:
+        if len(self.points) < 3:
+            return False
+
+        xs = np.asarray([point[0] for point in self.points], dtype=np.float64)
+        ys = np.asarray([point[1] for point in self.points], dtype=np.float64)
+        area = 0.5 * abs(np.dot(xs, np.roll(ys, -1)) - np.dot(ys, np.roll(xs, -1)))
+        return area > 0
+
+    @property
+    def bounds(self) -> Bounds2D:
+        xs = [point[0] for point in self.points]
+        ys = [point[1] for point in self.points]
+        return Bounds2D(min(xs), max(xs), min(ys), max(ys))
+
+
+@dataclass(frozen=True)
+class GridSelection:
+    bounds: Bounds2D
+    rows: int
+    cols: int
+
+    def is_valid(self) -> bool:
+        return self.bounds.is_valid() and self.rows > 0 and self.cols > 0
+
+    @property
+    def part_count(self) -> int:
+        return self.rows * self.cols
+
+
+@dataclass(frozen=True)
 class PreviewData:
     input_path: Path
     total_points: int
     bounds: Bounds2D
     preview_points: np.ndarray
+    preview_colors: np.ndarray
 
 
 @dataclass
@@ -84,6 +120,25 @@ class SplitResult:
     message: str = ""
 
 
+@dataclass(frozen=True)
+class GridPartResult:
+    part_number: int
+    output_path: Path
+    point_count: int
+    empty: bool = False
+
+
+@dataclass
+class GridSplitResult:
+    input_path: Path
+    input_points: int
+    rows: int
+    cols: int
+    parts: list[GridPartResult]
+    skipped: bool = False
+    message: str = ""
+
+
 def _validate_las_path(input_path: Path | str) -> Path:
     path = Path(input_path)
     if path.suffix.lower() != ".las":
@@ -103,11 +158,27 @@ def build_split_output_paths(input_path: Path | str) -> tuple[Path, Path]:
     return left, right
 
 
+def build_grid_output_paths(
+    input_path: Path | str,
+    rows: int,
+    cols: int,
+) -> list[Path]:
+    path = _validate_las_path(input_path)
+    if rows <= 0 or cols <= 0:
+        raise ValueError("rows and cols must be greater than 0")
+
+    return [
+        path.with_name(f"{path.stem}_grid_{rows}x{cols}_p{part_number}{path.suffix.lower()}")
+        for part_number in range(1, rows * cols + 1)
+    ]
+
+
 def load_preview_data(
     input_path: Path | str,
     *,
     max_points: int = 100_000,
     chunk_size: int = 1_000_000,
+    progress_callback: Optional[PreviewProgressCallback] = None,
 ) -> PreviewData:
     path = _validate_las_path(input_path)
     if max_points <= 0:
@@ -124,54 +195,170 @@ def load_preview_data(
 
         if total_points == 0:
             preview_points = np.empty((0, 2), dtype=np.float64)
-        else:
-            step = max(1, math.ceil(total_points / max_points))
-            offset = 0
-            samples: list[np.ndarray] = []
-
-            for points in reader.chunk_iterator(chunk_size):
-                point_count = len(points)
-                if point_count == 0:
-                    continue
-
-                if step == 1:
-                    sample_x = np.asarray(points.x)
-                    sample_y = np.asarray(points.y)
-                else:
-                    start = (-offset) % step
-                    sample_indices = np.arange(start, point_count, step, dtype=np.int64)
-                    sample_x = np.asarray(points.x)[sample_indices]
-                    sample_y = np.asarray(points.y)[sample_indices]
-
-                if sample_x.size:
-                    samples.append(np.column_stack((sample_x, sample_y)))
-
-                offset += point_count
-
-            preview_points = (
-                np.concatenate(samples, axis=0)
-                if samples
-                else np.empty((0, 2), dtype=np.float64)
+            preview_colors = np.empty((0, 3), dtype=np.uint8)
+            if progress_callback is not None:
+                progress_callback(0, 0)
+            return PreviewData(
+                input_path=path,
+                total_points=0,
+                bounds=bounds,
+                preview_points=preview_points,
+                preview_colors=preview_colors,
             )
+
+        step = max(1, math.ceil(total_points / max_points))
+        offset = 0
+        xyz_samples: list[np.ndarray] = []
+        rgb_samples: list[np.ndarray] = []
+        has_rgb = _header_has_rgb(reader.header)
+
+        for points in reader.chunk_iterator(chunk_size):
+            point_count = len(points)
+            if point_count == 0:
+                continue
+
+            sample_indices = _sample_indices(step, offset, point_count)
+            if sample_indices.size:
+                sample_x = np.asarray(points.x)[sample_indices]
+                sample_y = np.asarray(points.y)[sample_indices]
+                sample_z = np.asarray(points.z)[sample_indices]
+                xyz_samples.append(np.column_stack((sample_x, sample_y, sample_z)))
+
+                if has_rgb:
+                    sample_red = np.asarray(points.red)[sample_indices]
+                    sample_green = np.asarray(points.green)[sample_indices]
+                    sample_blue = np.asarray(points.blue)[sample_indices]
+                    rgb_samples.append(np.column_stack((sample_red, sample_green, sample_blue)))
+
+            offset += point_count
+            if progress_callback is not None:
+                progress_callback(offset, total_points)
+
+        preview_xyz = (
+            np.concatenate(xyz_samples, axis=0)
+            if xyz_samples
+            else np.empty((0, 3), dtype=np.float64)
+        )
+        preview_points = preview_xyz[:, :2]
+        preview_colors = _resolve_preview_colors(
+            preview_xyz[:, 2] if preview_xyz.size else np.empty(0, dtype=np.float64),
+            np.concatenate(rgb_samples, axis=0) if rgb_samples else None,
+        )
 
     return PreviewData(
         input_path=path,
         total_points=total_points,
         bounds=bounds,
         preview_points=preview_points,
+        preview_colors=preview_colors,
     )
+
+
+def combine_preview_data(
+    previews: list[PreviewData],
+    *,
+    label_path: Path | None = None,
+) -> PreviewData:
+    if not previews:
+        raise ValueError("at least one preview is required")
+
+    if len(previews) == 1:
+        preview = previews[0]
+        if label_path is None or label_path == preview.input_path:
+            return preview
+        return PreviewData(
+            input_path=label_path,
+            total_points=preview.total_points,
+            bounds=preview.bounds,
+            preview_points=preview.preview_points,
+            preview_colors=preview.preview_colors,
+        )
+
+    total_points = sum(preview.total_points for preview in previews)
+    bounds = Bounds2D(
+        min_x=min(preview.bounds.min_x for preview in previews),
+        max_x=max(preview.bounds.max_x for preview in previews),
+        min_y=min(preview.bounds.min_y for preview in previews),
+        max_y=max(preview.bounds.max_y for preview in previews),
+    )
+    preview_points = np.concatenate([preview.preview_points for preview in previews], axis=0)
+    preview_colors = np.concatenate([preview.preview_colors for preview in previews], axis=0)
+
+    return PreviewData(
+        input_path=label_path or previews[0].input_path,
+        total_points=total_points,
+        bounds=bounds,
+        preview_points=preview_points,
+        preview_colors=preview_colors,
+    )
+
+
+def _normalize_crop_selection(selection: Bounds2D | PolygonSelection) -> PolygonSelection:
+    if isinstance(selection, PolygonSelection):
+        return selection
+
+    if isinstance(selection, Bounds2D):
+        return PolygonSelection(
+            points=(
+                (selection.min_x, selection.min_y),
+                (selection.max_x, selection.min_y),
+                (selection.max_x, selection.max_y),
+                (selection.min_x, selection.max_y),
+            )
+        )
+
+    raise TypeError("Unsupported crop selection type")
+
+
+def _points_in_polygon(xs: np.ndarray, ys: np.ndarray, polygon: PolygonSelection) -> np.ndarray:
+    vertices = np.asarray(polygon.points, dtype=np.float64)
+    x1 = vertices[:, 0]
+    y1 = vertices[:, 1]
+    x2 = np.roll(x1, -1)
+    y2 = np.roll(y1, -1)
+
+    inside = np.zeros(xs.shape[0], dtype=bool)
+    on_boundary = np.zeros(xs.shape[0], dtype=bool)
+    tolerance = 1e-9
+
+    for ax, ay, bx, by in zip(x1, y1, x2, y2):
+        min_x = min(ax, bx) - tolerance
+        max_x = max(ax, bx) + tolerance
+        min_y = min(ay, by) - tolerance
+        max_y = max(ay, by) + tolerance
+
+        cross = (xs - ax) * (by - ay) - (ys - ay) * (bx - ax)
+        edge_scale = max(abs(bx - ax), abs(by - ay), 1.0)
+        on_segment = (
+            (np.abs(cross) <= tolerance * edge_scale)
+            & (xs >= min_x)
+            & (xs <= max_x)
+            & (ys >= min_y)
+            & (ys <= max_y)
+        )
+        on_boundary |= on_segment
+
+        denominator = by - ay if not math.isclose(by, ay) else 1.0
+        intersects = ((ay > ys) != (by > ys)) & (
+            xs <= ((bx - ax) * (ys - ay) / denominator + ax)
+        )
+        inside ^= intersects
+
+    return inside | on_boundary
 
 
 def crop_las(
     input_path: Path | str,
-    bounds: Bounds2D,
+    selection: Bounds2D | PolygonSelection,
     *,
     chunk_size: int = 1_000_000,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> CropResult:
     path = _validate_las_path(input_path)
-    if not bounds.is_valid():
-        raise ValueError("Crop bounds are not valid.")
+    polygon = _normalize_crop_selection(selection)
+    if not polygon.is_valid():
+        raise ValueError("Crop polygon is not valid.")
+    bounds = polygon.bounds
 
     output_path = build_crop_output_path(path)
     if output_path.exists():
@@ -201,21 +388,29 @@ def crop_las(
 
                     x = np.asarray(points.x)
                     y = np.asarray(points.y)
-                    mask = (
+                    bbox_mask = (
                         (x >= bounds.min_x)
                         & (x <= bounds.max_x)
                         & (y >= bounds.min_y)
                         & (y <= bounds.max_y)
                     )
 
+                    if bbox_mask.any():
+                        mask = np.zeros(point_count, dtype=bool)
+                        bbox_indices = np.flatnonzero(bbox_mask)
+                        polygon_mask = _points_in_polygon(x[bbox_mask], y[bbox_mask], polygon)
+                        mask[bbox_indices[polygon_mask]] = True
+
+                    else:
+                        mask = np.zeros(point_count, dtype=bool)
+
                     if mask.any():
                         if writer is None:
                             writer = stack.enter_context(
                                 laspy.open(output_path, mode="w", header=header)
                             )
-                        selected = points[mask]
-                        writer.write_points(selected)
-                        kept_points += len(selected)
+                        writer.write_points(points[mask])
+                        kept_points += int(mask.sum())
 
                     processed += point_count
                     if progress_callback is not None:
@@ -228,7 +423,7 @@ def crop_las(
                     input_points=total_points,
                     output_points=0,
                     empty=True,
-                    message="No points fell inside the selected rectangle.",
+                    message="No points fell inside the selected polygon.",
                 )
 
             return CropResult(
@@ -347,6 +542,219 @@ def split_las(
         _remove_file_if_exists(left_output_path)
         _remove_file_if_exists(right_output_path)
         raise
+
+
+def grid_split_las(
+    input_path: Path | str,
+    selection: GridSelection,
+    *,
+    chunk_size: int = 1_000_000,
+    progress_callback: Optional[ProgressCallback] = None,
+) -> GridSplitResult:
+    path = _validate_las_path(input_path)
+    if not selection.is_valid():
+        raise ValueError("Grid selection is not valid.")
+
+    output_paths = build_grid_output_paths(path, selection.rows, selection.cols)
+    existing_outputs = [output_path.name for output_path in output_paths if output_path.exists()]
+    if existing_outputs:
+        joined = ", ".join(existing_outputs)
+        return GridSplitResult(
+            input_path=path,
+            input_points=0,
+            rows=selection.rows,
+            cols=selection.cols,
+            parts=[
+                GridPartResult(part_number=index, output_path=output_paths[index - 1], point_count=0, empty=True)
+                for index in range(1, selection.part_count + 1)
+            ],
+            skipped=True,
+            message=f"Skipped because output already exists: {joined}",
+        )
+
+    cell_width = (selection.bounds.max_x - selection.bounds.min_x) / selection.cols
+    cell_height = (selection.bounds.max_y - selection.bounds.min_y) / selection.rows
+    if cell_width <= 0 or cell_height <= 0:
+        raise ValueError("Grid cell size must be greater than 0.")
+
+    point_counts = [0] * selection.part_count
+    created_files: list[Path] = []
+
+    try:
+        with laspy.open(path) as reader:
+            total_points = int(reader.header.point_count)
+            headers = [copy.deepcopy(reader.header) for _ in range(selection.part_count)]
+
+            with ExitStack() as stack:
+                writers: list[laspy.LasWriter | None] = [None] * selection.part_count
+                processed = 0
+
+                for points in reader.chunk_iterator(chunk_size):
+                    point_count = len(points)
+                    if point_count == 0:
+                        continue
+
+                    x = np.asarray(points.x)
+                    y = np.asarray(points.y)
+                    inside_mask = (
+                        (x >= selection.bounds.min_x)
+                        & (x <= selection.bounds.max_x)
+                        & (y >= selection.bounds.min_y)
+                        & (y <= selection.bounds.max_y)
+                    )
+
+                    if inside_mask.any():
+                        selected_points = points[inside_mask]
+                        selected_x = x[inside_mask]
+                        selected_y = y[inside_mask]
+                        part_indices = _compute_grid_part_indices(
+                            selected_x,
+                            selected_y,
+                            selection,
+                            cell_width,
+                            cell_height,
+                        )
+
+                        order = np.argsort(part_indices, kind="stable")
+                        sorted_part_indices = part_indices[order]
+                        boundaries = np.flatnonzero(np.diff(sorted_part_indices)) + 1
+                        start = 0
+                        for end in np.append(boundaries, order.size):
+                            group = order[start:end]
+                            if group.size == 0:
+                                start = end
+                                continue
+                            part_index = int(sorted_part_indices[start])
+                            writer = writers[part_index]
+                            if writer is None:
+                                writer = stack.enter_context(
+                                    laspy.open(output_paths[part_index], mode="w", header=headers[part_index])
+                                )
+                                writers[part_index] = writer
+                                created_files.append(output_paths[part_index])
+
+                            writer.write_points(selected_points[group])
+                            point_counts[part_index] += int(group.size)
+                            start = end
+
+                    processed += point_count
+                    if progress_callback is not None:
+                        progress_callback(processed, total_points)
+
+        parts = [
+            GridPartResult(
+                part_number=index + 1,
+                output_path=output_paths[index],
+                point_count=point_counts[index],
+                empty=point_counts[index] == 0,
+            )
+            for index in range(selection.part_count)
+        ]
+        message = _format_grid_message(parts)
+
+        return GridSplitResult(
+            input_path=path,
+            input_points=total_points,
+            rows=selection.rows,
+            cols=selection.cols,
+            parts=parts,
+            message=message,
+        )
+    except Exception:
+        for created_file in created_files:
+            _remove_file_if_exists(created_file)
+        raise
+
+
+def _sample_indices(step: int, offset: int, point_count: int) -> np.ndarray:
+    if step == 1:
+        return np.arange(point_count, dtype=np.int64)
+
+    start = (-offset) % step
+    return np.arange(start, point_count, step, dtype=np.int64)
+
+
+def _header_has_rgb(header: laspy.LasHeader) -> bool:
+    dims = {str(name).lower() for name in header.point_format.dimension_names}
+    return {"red", "green", "blue"}.issubset(dims)
+
+
+def _resolve_preview_colors(
+    z_values: np.ndarray,
+    rgb_samples: np.ndarray | None,
+) -> np.ndarray:
+    if z_values.size == 0:
+        return np.empty((0, 3), dtype=np.uint8)
+
+    if rgb_samples is not None and rgb_samples.size:
+        return _normalize_rgb_samples(rgb_samples)
+
+    return _colorize_from_elevation(z_values)
+
+
+def _normalize_rgb_samples(rgb_samples: np.ndarray) -> np.ndarray:
+    rgb = rgb_samples.astype(np.float32)
+    low = np.percentile(rgb, 1, axis=0)
+    high = np.percentile(rgb, 99, axis=0)
+    span = np.maximum(high - low, 1.0)
+    normalized = np.clip((rgb - low) / span, 0.0, 1.0)
+
+    # A small gamma lift keeps previews readable when source RGB is dim.
+    boosted = 0.25 + 0.75 * np.sqrt(normalized)
+    return np.rint(boosted * 255.0).astype(np.uint8)
+
+
+def _colorize_from_elevation(z_values: np.ndarray) -> np.ndarray:
+    z_min = float(np.min(z_values))
+    z_max = float(np.max(z_values))
+    if math.isclose(z_min, z_max):
+        flat_color = np.array([56, 116, 191], dtype=np.uint8)
+        return np.repeat(flat_color[np.newaxis, :], z_values.shape[0], axis=0)
+
+    normalized = np.clip((z_values - z_min) / (z_max - z_min), 0.0, 1.0)
+    anchors = np.array([0.0, 0.35, 0.7, 1.0], dtype=np.float64)
+    palette = np.array(
+        [
+            [35, 79, 158],
+            [41, 182, 246],
+            [110, 201, 125],
+            [245, 158, 11],
+        ],
+        dtype=np.float64,
+    )
+
+    channels = [
+        np.interp(normalized, anchors, palette[:, channel_index])
+        for channel_index in range(3)
+    ]
+    return np.rint(np.column_stack(channels)).astype(np.uint8)
+
+
+def _compute_grid_part_indices(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    selection: GridSelection,
+    cell_width: float,
+    cell_height: float,
+) -> np.ndarray:
+    cols = np.floor((xs - selection.bounds.min_x) / cell_width).astype(np.int64)
+    rows_from_bottom = np.floor((ys - selection.bounds.min_y) / cell_height).astype(np.int64)
+
+    cols = np.clip(cols, 0, selection.cols - 1)
+    rows_from_bottom = np.clip(rows_from_bottom, 0, selection.rows - 1)
+    rows_from_top = selection.rows - 1 - rows_from_bottom
+    return rows_from_top * selection.cols + cols
+
+
+def _format_grid_message(parts: list[GridPartResult]) -> str:
+    messages: list[str] = []
+    for part in parts:
+        label = f"p{part.part_number}"
+        if part.empty:
+            messages.append(f"{label}: no points written")
+        else:
+            messages.append(f"{label}: saved to {part.output_path.name} ({part.point_count:,} pts)")
+    return ". ".join(messages) + "."
 
 
 def _remove_file_if_exists(path: Path) -> None:

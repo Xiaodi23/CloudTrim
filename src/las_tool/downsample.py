@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -11,6 +12,8 @@ import numpy as np
 
 ProgressCallback = Callable[[int, int], None]
 
+_INT64_MAX = np.iinfo(np.int64).max
+
 
 @dataclass
 class DownsampleResult:
@@ -20,6 +23,16 @@ class DownsampleResult:
     output_points: int
     skipped: bool = False
     message: str = ""
+
+
+@dataclass(frozen=True)
+class PackedVoxelLayout:
+    base_x: int
+    base_y: int
+    base_z: int
+    size_x: int
+    size_y: int
+    size_z: int
 
 
 def format_resolution_tag(resolution: float) -> str:
@@ -36,10 +49,10 @@ def validate_resolution(value: str) -> float:
     try:
         resolution = float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError("分辨率必须是数字。") from exc
+        raise ValueError("Resolution must be a number.") from exc
 
     if resolution <= 0:
-        raise ValueError("分辨率必须大于 0。")
+        raise ValueError("Resolution must be greater than 0.")
 
     return resolution
 
@@ -59,17 +72,65 @@ def _voxel_keys(points: laspy.ScaleAwarePointRecord, resolution: float) -> np.nd
     return structured
 
 
+def _compute_packed_layout(header: laspy.LasHeader, resolution: float) -> PackedVoxelLayout | None:
+    min_x = int(np.floor(float(header.mins[0]) / resolution))
+    min_y = int(np.floor(float(header.mins[1]) / resolution))
+    min_z = int(np.floor(float(header.mins[2]) / resolution))
+    max_x = int(np.floor(float(header.maxs[0]) / resolution))
+    max_y = int(np.floor(float(header.maxs[1]) / resolution))
+    max_z = int(np.floor(float(header.maxs[2]) / resolution))
+
+    size_x = max_x - min_x + 1
+    size_y = max_y - min_y + 1
+    size_z = max_z - min_z + 1
+
+    if min(size_x, size_y, size_z) <= 0:
+        return None
+
+    if size_y > _INT64_MAX // size_z:
+        return None
+    yz_size = size_y * size_z
+    if size_x > _INT64_MAX // yz_size:
+        return None
+
+    return PackedVoxelLayout(
+        base_x=min_x,
+        base_y=min_y,
+        base_z=min_z,
+        size_x=size_x,
+        size_y=size_y,
+        size_z=size_z,
+    )
+
+
+def _packed_voxel_keys(
+    points: laspy.ScaleAwarePointRecord,
+    resolution: float,
+    layout: PackedVoxelLayout,
+) -> np.ndarray:
+    x = np.floor(np.asarray(points.x) / resolution).astype(np.int64) - layout.base_x
+    y = np.floor(np.asarray(points.y) / resolution).astype(np.int64) - layout.base_y
+    z = np.floor(np.asarray(points.z) / resolution).astype(np.int64) - layout.base_z
+    return (x * layout.size_y + y) * layout.size_z + z
+
+
+def _chunk_first_indices(keys: np.ndarray) -> np.ndarray:
+    _, first_indices = np.unique(keys, return_index=True)
+    first_indices.sort()
+    return first_indices.astype(np.int64, copy=False)
+
+
 def downsample_las(
     input_path: Path,
     resolution: float,
     *,
-    chunk_size: int = 1_000_000,
+    chunk_size: int = 2_000_000,
     progress_callback: Optional[ProgressCallback] = None,
 ) -> DownsampleResult:
     input_path = Path(input_path)
 
     if input_path.suffix.lower() != ".las":
-        raise ValueError(f"仅支持 .las 文件: {input_path.name}")
+        raise ValueError(f"Only .las files are supported: {input_path.name}")
 
     output_path = build_output_path(input_path, resolution)
     if output_path.exists():
@@ -79,45 +140,75 @@ def downsample_las(
             input_points=0,
             output_points=0,
             skipped=True,
-            message="输出文件已存在，已跳过。",
+            message="Skipped because the output file already exists.",
         )
 
-    total_points = 0
-    kept_points = 0
-    seen_voxels: set[bytes] = set()
+    temporary_file = tempfile.NamedTemporaryFile(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_path.parent,
+        delete=False,
+    )
+    temporary_path = Path(temporary_file.name)
+    temporary_file.close()
 
-    with laspy.open(input_path) as reader:
-        total_points = reader.header.point_count
-        header = copy.deepcopy(reader.header)
+    try:
+        with laspy.open(input_path) as reader:
+            total_points = int(reader.header.point_count)
+            header = copy.deepcopy(reader.header)
+            packed_layout = _compute_packed_layout(reader.header, resolution)
 
-        with laspy.open(output_path, mode="w", header=header) as writer:
+            kept_points = 0
             processed = 0
 
-            for points in reader.chunk_iterator(chunk_size):
-                point_count = len(points)
-                if point_count == 0:
-                    continue
+            if packed_layout is None:
+                seen_voxels: set[bytes] = set()
+            else:
+                seen_voxels = set()
 
-                keys = _voxel_keys(points, resolution)
-                _, first_indices = np.unique(keys, return_index=True)
-                first_indices.sort()
-
-                keep_indices = []
-                for index in first_indices.tolist():
-                    key = keys[index].tobytes()
-                    if key in seen_voxels:
+            with laspy.open(temporary_path, mode="w", header=header) as writer:
+                for points in reader.chunk_iterator(chunk_size):
+                    point_count = len(points)
+                    if point_count == 0:
                         continue
-                    seen_voxels.add(key)
-                    keep_indices.append(index)
 
-                if keep_indices:
-                    selected = points[np.asarray(keep_indices, dtype=np.int64)]
-                    writer.write_points(selected)
-                    kept_points += len(selected)
+                    if packed_layout is None:
+                        keys = _voxel_keys(points, resolution)
+                        first_indices = _chunk_first_indices(keys)
+                        keep_indices: list[int] = []
+                        for index in first_indices.tolist():
+                            key = keys[index].tobytes()
+                            if key in seen_voxels:
+                                continue
+                            seen_voxels.add(key)
+                            keep_indices.append(index)
+                    else:
+                        packed_keys = _packed_voxel_keys(points, resolution, packed_layout)
+                        first_indices = _chunk_first_indices(packed_keys)
+                        keep_indices = []
+                        for index in first_indices.tolist():
+                            key = int(packed_keys[index])
+                            if key in seen_voxels:
+                                continue
+                            seen_voxels.add(key)
+                            keep_indices.append(index)
 
-                processed += point_count
-                if progress_callback is not None:
-                    progress_callback(processed, total_points)
+                    if keep_indices:
+                        selected = points[np.asarray(keep_indices, dtype=np.int64)]
+                        writer.write_points(selected)
+                        kept_points += len(selected)
+
+                    processed += point_count
+                    if progress_callback is not None:
+                        progress_callback(processed, total_points)
+
+        temporary_path.replace(output_path)
+    except Exception:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
     return DownsampleResult(
         input_path=input_path,
@@ -125,5 +216,5 @@ def downsample_las(
         input_points=total_points,
         output_points=kept_points,
         skipped=False,
-        message="处理完成。",
+        message="Processing completed.",
     )

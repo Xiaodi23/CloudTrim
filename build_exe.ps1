@@ -1,18 +1,93 @@
+[CmdletBinding()]
+param(
+    [switch]$KeepBuildEnvironment
+)
+
 $ErrorActionPreference = "Stop"
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $root
+$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$BuildEnvironment = Join-Path $ProjectRoot ".build-venv"
+$BuildDirectory = Join-Path $ProjectRoot "build"
+$DistributionDirectory = Join-Path $ProjectRoot "dist"
+$ApplicationDirectory = Join-Path $DistributionDirectory "LasTool"
+$ExecutablePath = Join-Path $ApplicationDirectory "LasTool.exe"
+$ArchivePath = Join-Path $DistributionDirectory "LasTool-windows-x64.zip"
 
-python -m pip install -r requirements.txt
+Set-Location -LiteralPath $ProjectRoot
 
-python -m PyInstaller `
-  --noconfirm `
-  --clean `
-  --windowed `
-  --name LasBatchDownsampler `
-  --paths "$root\src" `
-  --collect-all tkinterdnd2 `
-  main.py
+foreach ($Target in @($BuildDirectory, $DistributionDirectory)) {
+    $ResolvedProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
+    $ResolvedTarget = [System.IO.Path]::GetFullPath($Target)
+    if (-not $ResolvedTarget.StartsWith($ResolvedProjectRoot + [System.IO.Path]::DirectorySeparatorChar)) {
+        throw "Refusing to remove a path outside the project: $ResolvedTarget"
+    }
+    if (Test-Path -LiteralPath $ResolvedTarget) {
+        Remove-Item -LiteralPath $ResolvedTarget -Recurse -Force
+    }
+}
+
+New-Item -ItemType Directory -Path $BuildDirectory | Out-Null
+
+if (-not $KeepBuildEnvironment -and (Test-Path -LiteralPath $BuildEnvironment)) {
+    $ResolvedProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
+    $ResolvedEnvironment = [System.IO.Path]::GetFullPath($BuildEnvironment)
+    if (-not $ResolvedEnvironment.StartsWith($ResolvedProjectRoot + [System.IO.Path]::DirectorySeparatorChar)) {
+        throw "Refusing to remove a path outside the project: $ResolvedEnvironment"
+    }
+    Remove-Item -LiteralPath $ResolvedEnvironment -Recurse -Force
+}
+
+if (-not (Test-Path -LiteralPath $BuildEnvironment)) {
+    python -m venv $BuildEnvironment
+}
+
+$BuildPython = Join-Path $BuildEnvironment "Scripts\python.exe"
+& $BuildPython -m pip install --upgrade pip
+& $BuildPython -m pip install -r requirements-dev.txt
+& $BuildPython -m unittest discover -s tests -v
+
+& $BuildPython -m PyInstaller `
+    --noconfirm `
+    --clean `
+    --windowed `
+    --onedir `
+    --name LasTool `
+    --paths (Join-Path $ProjectRoot "src") `
+    --specpath $BuildDirectory `
+    --collect-all tkinterdnd2 `
+    --exclude-module matplotlib `
+    --exclude-module pandas `
+    --exclude-module scipy `
+    --exclude-module sklearn `
+    --exclude-module pyproj `
+    --exclude-module torch `
+    --exclude-module tensorflow `
+    main.py
+
+if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
+    throw "Build did not produce the expected executable: $ExecutablePath"
+}
+
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "README.md") -Destination $ApplicationDirectory
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "LICENSE") -Destination $ApplicationDirectory
+Compress-Archive -LiteralPath $ApplicationDirectory -DestinationPath $ArchivePath -CompressionLevel Optimal
+
+$ArchiveSizeMB = [math]::Round((Get-Item -LiteralPath $ArchivePath).Length / 1MB, 2)
+
+if (-not $KeepBuildEnvironment) {
+    foreach ($Target in @($BuildDirectory, $BuildEnvironment)) {
+        $ResolvedProjectRoot = [System.IO.Path]::GetFullPath($ProjectRoot)
+        $ResolvedTarget = [System.IO.Path]::GetFullPath($Target)
+        if (-not $ResolvedTarget.StartsWith($ResolvedProjectRoot + [System.IO.Path]::DirectorySeparatorChar)) {
+            throw "Refusing to remove a path outside the project: $ResolvedTarget"
+        }
+        if (Test-Path -LiteralPath $ResolvedTarget) {
+            Remove-Item -LiteralPath $ResolvedTarget -Recurse -Force
+        }
+    }
+}
 
 Write-Host ""
-Write-Host "Build completed: $root\dist\LasBatchDownsampler\LasBatchDownsampler.exe"
+Write-Host "Portable build completed."
+Write-Host "Executable: $ExecutablePath"
+Write-Host "Archive: $ArchivePath ($ArchiveSizeMB MB)"
