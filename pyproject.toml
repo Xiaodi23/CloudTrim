@@ -31,5 +31,8 @@ cloudtrim = "las_tool:run_app"
 [tool.setuptools]
 package-dir = { "" = "src" }
 
+[tool.setuptools.package-data]
+las_tool = ["assets/*.ico"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

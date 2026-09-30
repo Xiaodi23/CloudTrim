@@ -52,6 +52,8 @@ $BuildPython = Join-Path $BuildEnvironment "Scripts\python.exe"
     --windowed `
     --onedir `
     --name CloudTrim `
+    --icon (Join-Path $ProjectRoot "src\las_tool\assets\cloudtrim.ico") `
+    --add-data ((Join-Path $ProjectRoot "src\las_tool\assets") + ";las_tool\assets") `
     --paths (Join-Path $ProjectRoot "src") `
     --specpath $BuildDirectory `
     --collect-all tkinterdnd2 `
