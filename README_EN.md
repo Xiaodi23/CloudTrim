@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](https://github.com/Xiaodi23/CloudTrim/releases/latest)
 
-CloudTrim is a lightweight Windows desktop application for batch processing `.las` point clouds. It supports voxel downsampling, polygon cropping, line splitting, and grid splitting while preserving the original LAS point format and attributes. All processing happens locally. The application interface is in English.
+CloudTrim is a lightweight Windows desktop application for batch processing `.las` and `.laz` point clouds. It supports voxel downsampling, polygon cropping, line splitting, and grid splitting while preserving the original LAS point format and attributes. All processing happens locally. The application interface is in English.
 
 > [Download the Windows portable package](https://github.com/Xiaodi23/CloudTrim/releases/latest) · [View all releases](https://github.com/Xiaodi23/CloudTrim/releases)
 
@@ -17,8 +17,9 @@ CloudTrim is a lightweight Windows desktop application for batch processing `.la
 - Polygon crop lets you draw a polygon in a sampled XY top view, then exports full-resolution points inside it.
 - Line split uses a directed line to export points on its left and right sides.
 - Grid split divides the full bounds into a configurable row-by-column grid or limits the operation to a selected rectangle.
-- Multi-file processing previews several LAS files and applies one crop or split selection to all of them.
-- Long-running work stays in the background, and independent files can be processed in parallel.
+- Reads and writes both `.las` and compressed `.laz`; outputs keep the format of the input file.
+- Multi-file processing previews several LAS/LAZ files and applies one crop or split selection to all of them.
+- Long-running work stays in the background, independent files can be processed in parallel, and a progress bar and Cancel button are provided.
 - Existing results are never overwritten. Incomplete outputs are removed after a failure.
 
 ## Performance
@@ -29,15 +30,15 @@ The measurements below come from single-file runs on a Windows PC with an Intel 
 
 | Operation | Time | Throughput |
 | --- | --- | --- |
-| Crop (half of the extent) | 2.3 s | about 8.7 M points/s |
-| Line split | 2.1 s | about 9.3 M points/s |
-| Voxel downsample (0.2 m, almost no duplicates) | 16.2 s | about 1.2 M points/s |
-| Voxel downsample (1.0 m, 35% of points kept) | 13.0 s | about 1.5 M points/s |
+| Crop (half of the extent) | 2.4 s | about 8.5 M points/s |
+| Line split | 2.2 s | about 9.1 M points/s |
+| Voxel downsample (0.2 m, almost no duplicates) | 8.2 s | about 2.5 M points/s |
+| Voxel downsample (1.0 m, 35% of points kept) | 5.1 s | about 3.9 M points/s |
 
 Notes:
 
 - Results depend on hardware, point distribution, and how many points are kept, so they will differ on other machines. Random points rarely share a voxel, which is a slower case for downsampling.
-- For reference, a naive approach that loads all points with `laspy` and de-duplicates them with `numpy.unique` took 27.2 s on the same data.
+- For reference, a naive approach that loads all points with `laspy` and de-duplicates them with `numpy.unique` took 27.1 s on the same data.
 - CloudTrim was not compared against LAStools, PDAL, CloudCompare, or other software, so no claim is made that it is faster than they are.
 
 ## Download and use the portable version
@@ -108,11 +109,10 @@ The suite covers downsampling consistency and failure cleanup, output paths, inp
 
 ## Current limitations
 
-- Only uncompressed `.las` files are supported. `.laz` is not yet supported.
 - Selection operates in an XY top view. There is no 3D box selection or free rotation.
 - Downsampling keeps the first point in each voxel rather than calculating a centroid.
-- Files are read in chunks, but the set of occupied voxel keys still grows with the data. Very large or sparse point clouds may require substantial memory.
-- Processing cannot currently be cancelled after it starts.
+- Files are read in chunks, but the index of kept voxels still grows with the data (about 8 bytes per voxel). Very large or sparse point clouds may require substantial memory.
+- Reading and writing `.laz` needs the `lazrs` backend (bundled in the portable package). On a synthetic 6-million-point terrain, `.laz` was about 3.2x smaller than `.las` with roughly a third lower throughput; real data will compress differently.
 - Outputs always go next to the input file, and existing results are always skipped.
 
 ## Privacy

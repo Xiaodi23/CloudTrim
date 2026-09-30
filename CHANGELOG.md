@@ -1,5 +1,17 @@
 # Changelog / 更新日志
 
+## Unreleased / 未发布
+
+### Added / 新增
+
+- Read and write compressed `.laz` files (via `lazrs`); outputs keep the input format.
+  支持读写压缩的 `.laz` 文件（通过 `lazrs`），输出沿用输入格式。
+
+### Changed / 变更
+
+- Voxel downsampling is about 2x faster and uses far less memory for the seen-voxel index, with identical output.
+  体素降采样约快 2 倍，已见体素索引占用的内存大幅减少，输出结果不变。
+
 ## 0.3.0 - 2026-09-30
 
 ### Added / 新增
