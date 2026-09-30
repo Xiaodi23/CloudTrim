@@ -9,9 +9,9 @@ $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BuildEnvironment = Join-Path $ProjectRoot ".build-venv"
 $BuildDirectory = Join-Path $ProjectRoot "build"
 $DistributionDirectory = Join-Path $ProjectRoot "dist"
-$ApplicationDirectory = Join-Path $DistributionDirectory "LasTool"
-$ExecutablePath = Join-Path $ApplicationDirectory "LasTool.exe"
-$ArchivePath = Join-Path $DistributionDirectory "LasTool-windows-x64.zip"
+$ApplicationDirectory = Join-Path $DistributionDirectory "CloudTrim"
+$ExecutablePath = Join-Path $ApplicationDirectory "CloudTrim.exe"
+$ArchivePath = Join-Path $DistributionDirectory "CloudTrim-windows-x64.zip"
 
 Set-Location -LiteralPath $ProjectRoot
 
@@ -51,7 +51,7 @@ $BuildPython = Join-Path $BuildEnvironment "Scripts\python.exe"
     --clean `
     --windowed `
     --onedir `
-    --name LasTool `
+    --name CloudTrim `
     --paths (Join-Path $ProjectRoot "src") `
     --specpath $BuildDirectory `
     --collect-all tkinterdnd2 `

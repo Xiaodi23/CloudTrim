@@ -17,7 +17,7 @@
 
 - [ ] **Step 1: Replace the English landing page with natural Simplified Chinese**
 
-Use this exact section order: language switch, project title and summary, badges, portable download callout, features, portable use, source use, output table, build, tests, limitations, privacy, license. Link the language switch to `README.md` and `README_EN.md`; link the download to `https://github.com/xya-0143/lasTool/releases/download/v0.1.0/LasTool-windows-x64.zip` and the release page to `https://github.com/xya-0143/lasTool/releases/latest`.
+Use this exact section order: language switch, project title and summary, badges, portable download callout, features, portable use, source use, output table, build, tests, limitations, privacy, license. Link the language switch to `README.md` and `README_EN.md`; link the download to `https://github.com/Xiaodi23/CloudTrim/releases/download/v0.1.0/LasTool-windows-x64.zip` and the release page to `https://github.com/Xiaodi23/CloudTrim/releases/latest`.
 
 - [ ] **Step 2: Review the Chinese prose for natural technical writing**
 

@@ -2,12 +2,12 @@
 
 ## Release Candidate
 
-- Artifact: `dist/LasTool-windows-x64.zip`
+- Artifact: `dist/CloudTrim-windows-x64.zip`
 - Archive size: 26,155,625 bytes (24.94 MB)
 - Extracted size: 69.53 MB
 - ZIP entries: 1,132
 - SHA-256: `F56CEEEEB5E3F0859BE459BFEA7F81D37B3D8D798444AA477D4EA4FE537D3C22`
-- Required entries confirmed: `LasTool/LasTool.exe`, `LasTool/README.md`, and `LasTool/LICENSE`
+- Required entries confirmed: `CloudTrim/CloudTrim.exe`, `CloudTrim/README.md`, and `CloudTrim/LICENSE`
 
 These values describe the local release candidate built on 2026-08-12. A GitHub Actions build can have a different hash when its Python or dependency patch versions differ.
 
@@ -33,8 +33,8 @@ The machine-wide Anaconda environment has unrelated package conflicts involving 
 
 1. Copy the ZIP to a clean Windows 10 or Windows 11 machine.
 2. Verify the SHA-256 published with that release.
-3. Extract the complete `LasTool` folder.
-4. Launch `LasTool.exe` and confirm both tabs open with English controls.
+3. Extract the complete `CloudTrim` folder.
+4. Launch `CloudTrim.exe` and confirm both tabs open with English controls.
 5. Load a small `.las` sample and run batch downsampling.
 6. Load the same sample in Split / Crop and verify polygon crop, line split, and a 2 x 2 grid split.
 7. Confirm outputs retain LAS attributes and appear next to the source file.

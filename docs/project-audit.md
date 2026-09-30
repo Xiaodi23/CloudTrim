@@ -1,4 +1,4 @@
-# LasTool Project Audit
+# CloudTrim Project Audit
 
 ## Completed for the Public Release
 
@@ -36,4 +36,4 @@
 
 ## Scope Guidance
 
-Keep LasTool focused on fast local preprocessing. Avoid turning it into a full 3D point-cloud editor; dedicated tools already serve that role. The best direction is a dependable small utility with predictable resource use, clear batch controls, and reproducible outputs.
+Keep CloudTrim focused on fast local preprocessing. Avoid turning it into a full 3D point-cloud editor; dedicated tools already serve that role. The best direction is a dependable small utility with predictable resource use, clear batch controls, and reproducible outputs.

@@ -1851,11 +1851,11 @@ class SplitCropPage(ttk.Frame, LogMixin):
         return "Grid split"
 
 
-class LasToolApp:
+class CloudTrimApp:
     def __init__(self) -> None:
         root_class = TkinterDnD.Tk if HAS_DND else tk.Tk
         self.root = root_class()
-        self.root.title("LasTool - Point Cloud Batch Processor")
+        self.root.title("CloudTrim - Point Cloud Batch Processor")
         self.root.geometry("1180x820")
         self.root.minsize(900, 620)
 
@@ -1873,4 +1873,4 @@ class LasToolApp:
 
 
 def run_app() -> None:
-    LasToolApp().run()
+    CloudTrimApp().run()

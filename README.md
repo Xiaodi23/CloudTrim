@@ -1,15 +1,15 @@
 [简体中文](README.md) | [English](README_EN.md)
 
-# LasTool
+# CloudTrim
 
-[![Windows tests and release](https://github.com/xya-0143/lasTool/actions/workflows/windows-release.yml/badge.svg)](https://github.com/xya-0143/lasTool/actions/workflows/windows-release.yml)
-[![Latest release](https://img.shields.io/github/v/release/xya-0143/lasTool)](https://github.com/xya-0143/lasTool/releases/latest)
+[![Windows tests and release](https://github.com/Xiaodi23/CloudTrim/actions/workflows/windows-release.yml/badge.svg)](https://github.com/Xiaodi23/CloudTrim/actions/workflows/windows-release.yml)
+[![Latest release](https://img.shields.io/github/v/release/Xiaodi23/CloudTrim)](https://github.com/Xiaodi23/CloudTrim/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](https://github.com/xya-0143/lasTool/releases/latest)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D4.svg)](https://github.com/Xiaodi23/CloudTrim/releases/latest)
 
-LasTool 是一个轻量级 Windows 桌面工具，用于批量处理 `.las` 点云。它支持体素降采样、多边形裁剪、直线分割和格网分割，并保留原始 LAS 点格式与属性。所有处理都在本地完成，界面语言为英文。
+CloudTrim 是一个轻量级 Windows 桌面工具，用于批量处理 `.las` 点云。它支持体素降采样、多边形裁剪、直线分割和格网分割，并保留原始 LAS 点格式与属性。所有处理都在本地完成，界面语言为英文。
 
-> [直接下载 Windows 便携版 v0.1.0](https://github.com/xya-0143/lasTool/releases/download/v0.1.0/LasTool-windows-x64.zip) · [查看全部版本](https://github.com/xya-0143/lasTool/releases)
+> [直接下载 Windows 便携版](https://github.com/Xiaodi23/CloudTrim/releases/latest) · [查看全部版本](https://github.com/Xiaodi23/CloudTrim/releases)
 
 ## 功能
 
@@ -21,13 +21,32 @@ LasTool 是一个轻量级 Windows 桌面工具，用于批量处理 `.las` 点�
 - 后台并行处理：耗时任务在后台运行，多个互不依赖的文件可以并行处理。
 - 安全输出：不覆盖已有结果；任务失败时会清理未完成的输出文件。
 
+## 性能
+
+处理时按块流式读写，内存占用不随文件大小线性增长；多个文件可以并行处理。
+
+下面是在一台 Intel Core i9-11900K、64 GB 内存、固态硬盘的 Windows 电脑上，对一份 2000 万点（680 MB，点格式 3）的随机点云做单文件处理得到的实测结果：
+
+| 操作 | 耗时 | 吞吐量 |
+| --- | --- | --- |
+| 裁剪（保留一半范围） | 2.3 秒 | 约 870 万点/秒 |
+| 直线分割 | 2.1 秒 | 约 930 万点/秒 |
+| 体素降采样（0.2 m，几乎不去重） | 16.2 秒 | 约 120 万点/秒 |
+| 体素降采样（1.0 m，保留 35% 的点） | 13.0 秒 | 约 150 万点/秒 |
+
+说明：
+
+- 这些数字取决于硬件、点云分布和输出比例，换一台机器结果会不同。随机点云的体素几乎不重复，属于降采样的偏慢情形。
+- 作为对照，用 `laspy` 一次性读入全部点再用 `numpy.unique` 去重的朴素写法，处理同一份数据需要 27.2 秒。
+- 没有与 LAStools、PDAL、CloudCompare 等其他软件做对比，因此这里不作“比它们更快”的结论。
+
 ## 下载并使用便携版
 
-1. 下载 [LasTool-windows-x64.zip](https://github.com/xya-0143/lasTool/releases/download/v0.1.0/LasTool-windows-x64.zip)。
+1. 下载 [CloudTrim-windows-x64.zip](https://github.com/Xiaodi23/CloudTrim/releases/latest)。
 2. 将 ZIP 完整解压到一个可写目录。
-3. 打开解压后的 `LasTool` 文件夹，双击 `LasTool.exe`。
+3. 打开解压后的 `CloudTrim` 文件夹，双击 `CloudTrim.exe`。
 
-便携版不需要安装 Python。请不要单独移动 `LasTool.exe`，旁边的 `_internal` 文件夹包含程序运行所需的组件。
+便携版不需要安装 Python。请不要单独移动 `CloudTrim.exe`，旁边的 `_internal` 文件夹包含程序运行所需的组件。
 
 程序目前没有代码签名，Windows SmartScreen 可能会显示安全提示。你可以先核对源码和 Release 页面，再选择 **More info > Run anyway**。
 
@@ -39,7 +58,7 @@ LasTool 是一个轻量级 Windows 桌面工具，用于批量处理 `.las` 点�
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\lastool.exe
+.\.venv\Scripts\cloudtrim.exe
 ```
 
 也可以直接运行仓库入口：
@@ -72,8 +91,8 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 
 输出文件：
 
-- `dist\LasTool\LasTool.exe`
-- `dist\LasTool-windows-x64.zip`
+- `dist\CloudTrim\CloudTrim.exe`
+- `dist\CloudTrim-windows-x64.zip`
 
 构建成功后，脚本会删除临时虚拟环境和 PyInstaller 中间文件。需要反复调试构建时，可以传入 `-KeepBuildEnvironment` 保留环境。
 
@@ -98,10 +117,10 @@ python -m unittest discover -s tests -v
 
 ## 隐私
 
-LasTool 不会发起网络请求，不收集遥测数据，也不会上传点云或要求用户提供凭据。生成的 LAS 文件、构建目录、虚拟环境、压缩包、缓存和包含本机路径的 PyInstaller 配置文件均已排除在 Git 版本控制之外。
+CloudTrim 不会发起网络请求，不收集遥测数据，也不会上传点云或要求用户提供凭据。生成的 LAS 文件、构建目录、虚拟环境、压缩包、缓存和包含本机路径的 PyInstaller 配置文件均已排除在 Git 版本控制之外。
 
 公开自己的分支前，可以按照 [`docs/release-checklist.md`](docs/release-checklist.md) 检查 Git 历史中的姓名、邮箱、凭据、数据文件和本机绝对路径。
 
 ## 许可证
 
-LasTool 使用 [MIT License](LICENSE) 发布。
+CloudTrim 使用 [MIT License](LICENSE) 发布。
