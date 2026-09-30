@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from las_tool.cancellation import OperationCancelled
+from las_tool.downsample import downsample_las
 from las_tool.split_crop import (
     Bounds2D,
     GridSelection,
@@ -435,6 +438,51 @@ class TransactionalOutputTests(unittest.TestCase):
                 sorted(p.name for p in Path(tmpdir).iterdir()),
                 ["sample.las", "sample_crop.las"],
             )
+
+
+class CancellationTests(unittest.TestCase):
+    def _sample(self, path: Path) -> None:
+        xs = np.linspace(0, 10, 50)
+        _write_sample_las(path, xs=xs, ys=xs, zs=xs)
+
+    def test_cancelled_operations_leave_only_the_source_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sample.las"
+            self._sample(path)
+
+            cancelled = threading.Event()
+            calls = {"count": 0}
+
+            def cancel_after_first_chunk(done: int, total: int) -> None:
+                calls["count"] += 1
+                cancelled.set()
+
+            grid = GridSelection(Bounds2D(0, 10, 0, 10), rows=1, cols=2)
+            runs = (
+                lambda: crop_las(path, Bounds2D(-1, 11, -1, 11), chunk_size=10,
+                                 progress_callback=cancel_after_first_chunk, cancel_event=cancelled),
+                lambda: split_las(path, LineSelection(5, 0, 5, 10), chunk_size=10,
+                                  progress_callback=cancel_after_first_chunk, cancel_event=cancelled),
+                lambda: grid_split_las(path, grid, chunk_size=10,
+                                       progress_callback=cancel_after_first_chunk, cancel_event=cancelled),
+                lambda: downsample_las(path, 0.1, chunk_size=10,
+                                       progress_callback=cancel_after_first_chunk, cancel_event=cancelled),
+            )
+            for run in runs:
+                cancelled.clear()
+                with self.assertRaises(OperationCancelled):
+                    run()
+                self.assertEqual([p.name for p in Path(tmpdir).iterdir()], ["sample.las"])
+
+    def test_event_set_before_start_cancels_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sample.las"
+            self._sample(path)
+            cancelled = threading.Event()
+            cancelled.set()
+            with self.assertRaises(OperationCancelled):
+                crop_las(path, Bounds2D(-1, 11, -1, 11), cancel_event=cancelled)
+            self.assertEqual([p.name for p in Path(tmpdir).iterdir()], ["sample.las"])
 
 
 if __name__ == "__main__":

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import copy
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 import laspy
 import numpy as np
+
+from .cancellation import raise_if_cancelled
 
 
 ProgressCallback = Callable[[int, int], None]
@@ -143,6 +146,7 @@ def _downsample_to_output(
     chunk_size: int,
     progress_callback: Optional[ProgressCallback],
     use_packed_layout: bool,
+    cancel_event: Optional[threading.Event] = None,
 ) -> tuple[int, int]:
     temporary_file = tempfile.NamedTemporaryFile(
         prefix=f".{output_path.name}.",
@@ -167,6 +171,7 @@ def _downsample_to_output(
 
             with laspy.open(temporary_path, mode="w", header=header) as writer:
                 for points in reader.chunk_iterator(chunk_size):
+                    raise_if_cancelled(cancel_event)
                     point_count = len(points)
                     if point_count == 0:
                         continue
@@ -218,6 +223,7 @@ def downsample_las(
     *,
     chunk_size: int = 2_000_000,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> DownsampleResult:
     input_path = Path(input_path)
 
@@ -245,6 +251,7 @@ def downsample_las(
                 chunk_size,
                 progress_callback,
                 use_packed_layout,
+                cancel_event,
             )
             break
         except _LayoutMismatch:

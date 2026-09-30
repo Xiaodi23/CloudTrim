@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+import threading
 import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from typing import Callable, Optional
 
 import laspy
 import numpy as np
+
+from .cancellation import raise_if_cancelled
 
 
 ProgressCallback = Callable[[int, int], None]
@@ -366,6 +369,7 @@ def crop_las(
     *,
     chunk_size: int = 1_000_000,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> CropResult:
     path = _validate_las_path(input_path)
     polygon = _normalize_crop_selection(selection)
@@ -396,6 +400,7 @@ def crop_las(
                 processed = 0
 
                 for points in reader.chunk_iterator(chunk_size):
+                    raise_if_cancelled(cancel_event)
                     point_count = len(points)
                     if point_count == 0:
                         continue
@@ -462,6 +467,7 @@ def split_las(
     *,
     chunk_size: int = 1_000_000,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> SplitResult:
     path = _validate_las_path(input_path)
     if not selection.is_valid():
@@ -504,6 +510,7 @@ def split_las(
                 processed = 0
 
                 for points in reader.chunk_iterator(chunk_size):
+                    raise_if_cancelled(cancel_event)
                     point_count = len(points)
                     if point_count == 0:
                         continue
@@ -577,6 +584,7 @@ def grid_split_las(
     *,
     chunk_size: int = 1_000_000,
     progress_callback: Optional[ProgressCallback] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> GridSplitResult:
     path = _validate_las_path(input_path)
     if not selection.is_valid():
@@ -617,6 +625,7 @@ def grid_split_las(
                 processed = 0
 
                 for points in reader.chunk_iterator(chunk_size):
+                    raise_if_cancelled(cancel_event)
                     point_count = len(points)
                     if point_count == 0:
                         continue
