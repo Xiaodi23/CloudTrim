@@ -14,6 +14,7 @@ import laspy
 import numpy as np
 
 from .cancellation import OperationCancelled
+from .formats import FILE_DIALOG_TYPES, is_supported_path, validate_point_cloud_path
 from .downsample import DownsampleResult, downsample_las, validate_resolution
 from .split_crop import (
     Bounds2D,
@@ -79,7 +80,7 @@ class DownsamplePage(ttk.Frame, LogMixin):
         self.resolution_var = tk.StringVar(value="0.2")
         self.status_var = tk.StringVar(value="Ready")
         self.drag_hint_var = tk.StringVar(
-            value="Drag .las files into the list"
+            value="Drag .las or .laz files into the list"
             if HAS_DND
             else "Drag-and-drop is unavailable; use Add Files instead"
         )
@@ -168,12 +169,12 @@ class DownsamplePage(ttk.Frame, LogMixin):
 
     def _configure_drop(self) -> None:
         if not HAS_DND:
-            self.log("Drag-and-drop is unavailable. Use Add Files to select .las files.")
+            self.log("Drag-and-drop is unavailable. Use Add Files to select .las or .laz files.")
             return
 
         self.tree.drop_target_register(DND_FILES)
         self.tree.dnd_bind("<<Drop>>", self._on_drop)
-        self.log("Drag-and-drop is enabled. Drop one or more .las files into the list.")
+        self.log("Drag-and-drop is enabled. Drop one or more .las or .laz files into the list.")
 
     def _on_drop(self, event) -> None:
         paths = [Path(item) for item in self.winfo_toplevel().tk.splitlist(event.data)]
@@ -182,7 +183,7 @@ class DownsamplePage(ttk.Frame, LogMixin):
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(
             title="Select LAS Files",
-            filetypes=[("LAS files", "*.las")],
+            filetypes=FILE_DIALOG_TYPES,
             parent=self,
         )
         if not paths:
@@ -193,8 +194,8 @@ class DownsamplePage(ttk.Frame, LogMixin):
         added = 0
         for raw_path in paths:
             path = Path(raw_path)
-            if path.suffix.lower() != ".las":
-                self.log(f"Ignored non-LAS file: {path}")
+            if not is_supported_path(path):
+                self.log(f"Ignored unsupported file: {path}")
                 continue
 
             normalized = str(path.resolve())
@@ -238,7 +239,7 @@ class DownsamplePage(ttk.Frame, LogMixin):
             return
 
         if not self.files:
-            messagebox.showwarning("No Files", "Add at least one .las file first.", parent=self)
+            messagebox.showwarning("No Files", "Add at least one .las or .laz file first.", parent=self)
             return
 
         try:
@@ -414,6 +415,7 @@ class DownsamplePage(ttk.Frame, LogMixin):
 
     @staticmethod
     def _read_point_count(path: Path) -> int:
+        validate_point_cloud_path(path)
         with laspy.open(path) as reader:
             return int(reader.header.point_count)
 
@@ -497,7 +499,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
         self.file_var = tk.StringVar(value="No files loaded")
         self.hint_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(
-            value="Open or drop .las files to preview, crop, or split them."
+            value="Open or drop .las or .laz files to preview, crop, or split them."
         )
         self.grid_rows_var = tk.StringVar(value="2")
         self.grid_cols_var = tk.StringVar(value="2")
@@ -746,14 +748,14 @@ class SplitCropPage(ttk.Frame, LogMixin):
 
     def _on_preview_drop(self, event) -> None:
         paths = [Path(item) for item in self.winfo_toplevel().tk.splitlist(event.data)]
-        valid_paths = [path for path in paths if path.suffix.lower() == ".las"]
-        ignored_paths = [path for path in paths if path.suffix.lower() != ".las"]
+        valid_paths = [path for path in paths if is_supported_path(path)]
+        ignored_paths = [path for path in paths if not is_supported_path(path)]
 
         for path in ignored_paths:
-            self.log(f"Ignored non-LAS file: {path}")
+            self.log(f"Ignored unsupported file: {path}")
 
         if not valid_paths:
-            self.status_var.set("No supported LAS files were found.")
+            self.status_var.set("No supported LAS or LAZ files were found.")
             return
 
         self._start_preview_load([*self.current_paths, *valid_paths])
@@ -764,7 +766,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
 
         paths = filedialog.askopenfilenames(
             title="Select LAS Files",
-            filetypes=[("LAS files", "*.las")],
+            filetypes=FILE_DIALOG_TYPES,
             parent=self,
         )
         if paths:
@@ -821,7 +823,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
         normalized: list[Path] = []
         seen: set[str] = set()
         for raw_path in paths:
-            if raw_path.suffix.lower() != ".las":
+            if not is_supported_path(raw_path):
                 continue
             resolved = str(raw_path.resolve())
             if resolved in seen:
@@ -853,6 +855,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
 
     @staticmethod
     def _read_point_count(path: Path) -> int:
+        validate_point_cloud_path(path)
         with laspy.open(path) as reader:
             return int(reader.header.point_count)
 
@@ -940,7 +943,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
             return
 
         if self.preview_data is None or not self.current_paths:
-            messagebox.showwarning("No Files", "Open or drop at least one .las file first.", parent=self)
+            messagebox.showwarning("No Files", "Open or drop at least one .las or .laz file first.", parent=self)
             return
 
         mode = self.mode_var.get()
@@ -1633,7 +1636,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
             self.canvas.create_text(
                 width / 2,
                 height / 2,
-                text="Open or drop .las files to display a top-view preview.",
+                text="Open or drop .las or .laz files to display a top-view preview.",
                 fill="#5c7080",
             )
             return

@@ -15,7 +15,13 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from las_tool.downsample import build_output_path, downsample_las, validate_resolution
+from las_tool.downsample import (
+    _select_new_voxels,
+    _unique_first_indices,
+    build_output_path,
+    downsample_las,
+    validate_resolution,
+)
 
 
 def _write_sample_las(path: Path, xs: np.ndarray, ys: np.ndarray, zs: np.ndarray) -> None:
@@ -151,6 +157,30 @@ class DownsampleTests(unittest.TestCase):
                 )
             )
             self.assertEqual(result.output_points, expected)
+
+
+class VoxelSelectionTests(unittest.TestCase):
+    def test_unique_first_indices_matches_numpy_unique(self) -> None:
+        rng = np.random.default_rng(5)
+        for max_key in (10, 1_000, 10**12, 2**62):
+            keys = rng.integers(0, max_key, size=5_000, dtype=np.int64)
+            expected_keys, expected_first = np.unique(keys, return_index=True)
+            actual_keys, actual_first = _unique_first_indices(keys)
+            self.assertTrue(np.array_equal(actual_keys, expected_keys))
+            self.assertTrue(np.array_equal(actual_first, expected_first))
+
+    def test_select_new_voxels_skips_keys_seen_in_earlier_chunks(self) -> None:
+        seen = np.empty(0, dtype=np.int64)
+        first, seen = _select_new_voxels(np.array([5, 3, 5, 9, 3], dtype=np.int64), seen)
+        self.assertEqual(first.tolist(), [0, 1, 3])
+        second, seen = _select_new_voxels(np.array([9, 4, 5, 4, 1], dtype=np.int64), seen)
+        self.assertEqual(second.tolist(), [1, 4])
+        self.assertEqual(seen.tolist(), [1, 3, 4, 5, 9])
+
+    def test_empty_chunk_is_handled(self) -> None:
+        first, seen = _select_new_voxels(np.empty(0, dtype=np.int64), np.array([1, 2], dtype=np.int64))
+        self.assertEqual(first.size, 0)
+        self.assertEqual(seen.tolist(), [1, 2])
 
 
 if __name__ == "__main__":

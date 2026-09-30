@@ -11,6 +11,7 @@ import laspy
 import numpy as np
 
 from .cancellation import raise_if_cancelled
+from .formats import is_compressed_path, validate_point_cloud_path
 
 
 ProgressCallback = Callable[[int, int], None]
@@ -139,6 +140,59 @@ def _chunk_first_indices(keys: np.ndarray) -> np.ndarray:
     return first_indices.astype(np.int64, copy=False)
 
 
+def _unique_first_indices(keys: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the sorted unique keys and the index of each key's first occurrence.
+
+    ``np.unique(..., return_index=True)`` needs a stable argsort, which is slow.
+    When ``key * n + index`` fits in int64 the pair can be sorted as one plain
+    integer array instead, which is several times faster.
+    """
+    count = keys.size
+    if count == 0:
+        return keys, np.empty(0, dtype=np.int64)
+
+    if int(keys.max()) < _INT64_MAX // count:
+        composite = keys * count + np.arange(count, dtype=np.int64)
+        composite.sort()
+        sorted_keys = composite // count
+        first = np.empty(count, dtype=bool)
+        first[0] = True
+        np.not_equal(sorted_keys[1:], sorted_keys[:-1], out=first[1:])
+        unique_keys = sorted_keys[first]
+        first_indices = composite[first] - unique_keys * count
+        return unique_keys, first_indices
+
+    unique_keys, first_indices = np.unique(keys, return_index=True)
+    return unique_keys, first_indices.astype(np.int64, copy=False)
+
+
+def _select_new_voxels(
+    packed_keys: np.ndarray,
+    seen_keys: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pick the first point of every voxel not seen in earlier chunks.
+
+    ``seen_keys`` is a sorted array of every voxel key kept so far. Keeping it
+    as a numpy array makes the per-chunk check a vectorised search and needs
+    8 bytes per voxel instead of a Python object per voxel.
+    """
+    unique_keys, first_indices = _unique_first_indices(packed_keys)
+
+    if seen_keys.size:
+        positions = np.searchsorted(seen_keys, unique_keys)
+        clipped = np.minimum(positions, seen_keys.size - 1)
+        is_new = seen_keys[clipped] != unique_keys
+    else:
+        positions = np.zeros(unique_keys.size, dtype=np.int64)
+        is_new = np.ones(unique_keys.size, dtype=bool)
+
+    new_keys = unique_keys[is_new]
+    keep_indices = np.sort(first_indices[is_new]).astype(np.int64, copy=False)
+    if new_keys.size:
+        seen_keys = np.insert(seen_keys, positions[is_new], new_keys)
+    return keep_indices, seen_keys
+
+
 def _downsample_to_output(
     input_path: Path,
     output_path: Path,
@@ -168,8 +222,14 @@ def _downsample_to_output(
             kept_points = 0
             processed = 0
             seen_voxels: set = set()
+            seen_keys = np.empty(0, dtype=np.int64)
 
-            with laspy.open(temporary_path, mode="w", header=header) as writer:
+            with laspy.open(
+                temporary_path,
+                mode="w",
+                header=header,
+                do_compress=is_compressed_path(output_path),
+            ) as writer:
                 for points in reader.chunk_iterator(chunk_size):
                     raise_if_cancelled(cancel_event)
                     point_count = len(points)
@@ -188,16 +248,9 @@ def _downsample_to_output(
                             keep_indices.append(index)
                     else:
                         packed_keys = _packed_voxel_keys(points, resolution, packed_layout)
-                        first_indices = _chunk_first_indices(packed_keys)
-                        keep_indices = []
-                        for index in first_indices.tolist():
-                            key = int(packed_keys[index])
-                            if key in seen_voxels:
-                                continue
-                            seen_voxels.add(key)
-                            keep_indices.append(index)
+                        keep_indices, seen_keys = _select_new_voxels(packed_keys, seen_keys)
 
-                    if keep_indices:
+                    if len(keep_indices):
                         selected = points[np.asarray(keep_indices, dtype=np.int64)]
                         writer.write_points(selected)
                         kept_points += len(selected)
@@ -227,8 +280,7 @@ def downsample_las(
 ) -> DownsampleResult:
     input_path = Path(input_path)
 
-    if input_path.suffix.lower() != ".las":
-        raise ValueError(f"Only .las files are supported: {input_path.name}")
+    validate_point_cloud_path(input_path)
 
     output_path = build_output_path(input_path, resolution)
     if output_path.exists():

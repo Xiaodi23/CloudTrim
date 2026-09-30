@@ -13,6 +13,7 @@ import laspy
 import numpy as np
 
 from .cancellation import raise_if_cancelled
+from .formats import is_compressed_path, validate_point_cloud_path
 
 
 ProgressCallback = Callable[[int, int], None]
@@ -145,10 +146,7 @@ class GridSplitResult:
 
 
 def _validate_las_path(input_path: Path | str) -> Path:
-    path = Path(input_path)
-    if path.suffix.lower() != ".las":
-        raise ValueError(f"Only .las files are supported: {path.name}")
-    return path
+    return validate_point_cloud_path(input_path)
 
 
 def build_crop_output_path(input_path: Path | str) -> Path:
@@ -427,7 +425,12 @@ def crop_las(
                         if writer is None:
                             temporaries[output_path] = _temporary_path(output_path)
                             writer = stack.enter_context(
-                                laspy.open(temporaries[output_path], mode="w", header=header)
+                                laspy.open(
+                                    temporaries[output_path],
+                                    mode="w",
+                                    header=header,
+                                    do_compress=is_compressed_path(output_path),
+                                )
                             )
                         writer.write_points(points[mask])
                         kept_points += int(mask.sum())
@@ -526,7 +529,10 @@ def split_las(
                             temporaries[left_output_path] = _temporary_path(left_output_path)
                             left_writer = stack.enter_context(
                                 laspy.open(
-                                    temporaries[left_output_path], mode="w", header=left_header
+                                    temporaries[left_output_path],
+                                    mode="w",
+                                    header=left_header,
+                                    do_compress=is_compressed_path(left_output_path),
                                 )
                             )
                         selected_left = points[left_mask]
@@ -538,7 +544,10 @@ def split_las(
                             temporaries[right_output_path] = _temporary_path(right_output_path)
                             right_writer = stack.enter_context(
                                 laspy.open(
-                                    temporaries[right_output_path], mode="w", header=right_header
+                                    temporaries[right_output_path],
+                                    mode="w",
+                                    header=right_header,
+                                    do_compress=is_compressed_path(right_output_path),
                                 )
                             )
                         selected_right = points[right_mask]
@@ -671,6 +680,7 @@ def grid_split_las(
                                         temporaries[output_paths[part_index]],
                                         mode="w",
                                         header=headers[part_index],
+                                        do_compress=is_compressed_path(output_paths[part_index]),
                                     )
                                 )
                                 writers[part_index] = writer

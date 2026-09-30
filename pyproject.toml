@@ -23,6 +23,7 @@ dependencies = [
     "laspy>=2.5,<3",
     "numpy>=1.24,<3",
     "tkinterdnd2>=0.4.2,<1",
+    "lazrs>=0.6,<1",
 ]
 
 [project.gui-scripts]
