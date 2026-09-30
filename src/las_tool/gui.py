@@ -13,6 +13,7 @@ import tkinter as tk
 import laspy
 import numpy as np
 
+from .cancellation import OperationCancelled
 from .downsample import DownsampleResult, downsample_las, validate_resolution
 from .split_crop import (
     Bounds2D,
@@ -46,6 +47,14 @@ class FileItem:
     status: str = "Pending"
 
 
+@dataclass
+class CancelledResult:
+    input_path: Path
+
+
+CANCELLED_MESSAGE = "__cancelled__"
+
+
 class LogMixin:
     log_text: tk.Text
 
@@ -64,6 +73,8 @@ class DownsamplePage(ttk.Frame, LogMixin):
         self.processing = False
         self.worker_thread: threading.Thread | None = None
         self.event_queue: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+        self.cancel_event = threading.Event()
+        self.progress_var = tk.DoubleVar(value=0.0)
 
         self.resolution_var = tk.StringVar(value="0.2")
         self.status_var = tk.StringVar(value="Ready")
@@ -99,13 +110,20 @@ class DownsamplePage(ttk.Frame, LogMixin):
         self.clear_button = ttk.Button(top, text="Clear List", command=self.clear_files)
         self.clear_button.grid(row=0, column=4, padx=(0, 8))
 
-        self.start_button = ttk.Button(top, text="Start", command=self.start_processing)
+        self.start_button = ttk.Button(
+            top, text="Start", command=self.start_processing, style="Primary.TButton"
+        )
         self.start_button.grid(row=0, column=5, sticky="e")
+
+        self.cancel_button = ttk.Button(
+            top, text="Cancel", command=self.cancel_processing, state="disabled"
+        )
+        self.cancel_button.grid(row=0, column=6, padx=(8, 0))
 
         ttk.Label(top, textvariable=self.drag_hint_var, foreground="#4f6b7a").grid(
             row=1,
             column=0,
-            columnspan=6,
+            columnspan=7,
             sticky="w",
             pady=(8, 0),
         )
@@ -141,8 +159,12 @@ class DownsamplePage(ttk.Frame, LogMixin):
         log_scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
+        ttk.Progressbar(self, variable=self.progress_var, maximum=100).grid(
+            row=3, column=0, sticky="ew", padx=12, pady=(0, 8)
+        )
+
         status_bar = ttk.Label(self, textvariable=self.status_var, anchor="w", relief="groove", padding=8)
-        status_bar.grid(row=3, column=0, sticky="ew")
+        status_bar.grid(row=4, column=0, sticky="ew")
 
     def _configure_drop(self) -> None:
         if not HAS_DND:
@@ -225,6 +247,8 @@ class DownsamplePage(ttk.Frame, LogMixin):
             messagebox.showerror("Invalid Resolution", str(exc), parent=self)
             return
 
+        self.cancel_event.clear()
+        self.progress_var.set(0.0)
         self.processing = True
         self._set_controls_enabled(False)
         self.status_var.set("Processing...")
@@ -240,6 +264,14 @@ class DownsamplePage(ttk.Frame, LogMixin):
             daemon=True,
         )
         self.worker_thread.start()
+
+    def cancel_processing(self) -> None:
+        if not self.processing or self.cancel_event.is_set():
+            return
+        self.cancel_event.set()
+        self.cancel_button.configure(state="disabled")
+        self.status_var.set("Cancelling... finishing the current chunk.")
+        self.log("Cancel requested. Unfinished files will be discarded.")
 
     def _worker_run(self, file_paths: list[Path], resolution: float) -> None:
         completed = 0
@@ -318,6 +350,8 @@ class DownsamplePage(ttk.Frame, LogMixin):
 
         def process_one(input_path: Path) -> tuple[str, Path, DownsampleResult | None, str | None, str | None]:
             item_id = str(input_path.resolve())
+            if self.cancel_event.is_set():
+                return item_id, input_path, None, CANCELLED_MESSAGE, None
             self.event_queue.put(("file_status", {"item_id": item_id, "status": "Processing"}))
             self.event_queue.put(("log", {"message": f"Processing {input_path}"}))
 
@@ -326,7 +360,10 @@ class DownsamplePage(ttk.Frame, LogMixin):
                     input_path,
                     resolution,
                     progress_callback=make_progress_callback(item_id),
+                    cancel_event=self.cancel_event,
                 )
+            except OperationCancelled:
+                return item_id, input_path, None, CANCELLED_MESSAGE, None
             except Exception as exc:  # noqa: BLE001
                 message = f"{input_path.name} failed: {exc}"
                 return item_id, input_path, None, message, traceback.format_exc(limit=3)
@@ -350,7 +387,10 @@ class DownsamplePage(ttk.Frame, LogMixin):
                     )
                 )
 
-                if result is None:
+                if error_message == CANCELLED_MESSAGE:
+                    self.event_queue.put(("file_status", {"item_id": item_id, "status": "Cancelled"}))
+                    self.event_queue.put(("log", {"message": f"{input_path.name}: cancelled."}))
+                elif result is None:
                     self.event_queue.put(("file_status", {"item_id": item_id, "status": "Failed"}))
                     self.event_queue.put(("log", {"message": error_message or f"{input_path.name} failed"}))
                     if error_detail:
@@ -394,6 +434,7 @@ class DownsamplePage(ttk.Frame, LogMixin):
             self.start_button,
         ):
             widget.configure(state=state)
+        self.cancel_button.configure(state="disabled" if enabled else "normal")
 
     def _drain_events(self) -> None:
         try:
@@ -418,7 +459,9 @@ class DownsamplePage(ttk.Frame, LogMixin):
             total = payload["total"]
             if total:
                 percent = done / total * 100
-                self.status_var.set(f"Processing {percent:.1f}%")
+                self.progress_var.set(percent)
+                if not self.cancel_event.is_set():
+                    self.status_var.set(f"Processing {percent:.1f}%")
         elif event_name == "batch_progress":
             self.status_var.set(f"Completed {payload['completed']} / {payload['total_files']} file(s)")
         elif event_name == "log":
@@ -432,6 +475,10 @@ class DownsamplePage(ttk.Frame, LogMixin):
                 f"{statuses.count('Skipped')} skipped, "
                 f"{statuses.count('Failed')} failed"
             )
+            if statuses.count("Cancelled"):
+                summary += f", {statuses.count('Cancelled')} cancelled"
+            if not self.cancel_event.is_set():
+                self.progress_var.set(100.0)
             self.status_var.set(f"Finished: {summary}")
             self.log(f"Batch processing finished: {summary}.")
 
@@ -458,6 +505,9 @@ class SplitCropPage(ttk.Frame, LogMixin):
         self.loading_preview = False
         self.processing = False
         self.event_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        self.cancel_event = threading.Event()
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.coord_var = tk.StringVar(value="")
 
         self.crop_selection: PolygonSelection | None = None
         self.crop_points: list[tuple[float, float]] = []
@@ -492,79 +542,73 @@ class SplitCropPage(ttk.Frame, LogMixin):
 
         top = ttk.Frame(self, padding=12)
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(11, weight=1)
+        top.columnconfigure(5, weight=1)
 
         self.open_button = ttk.Button(top, text="Open LAS", command=self.open_file)
         self.open_button.grid(row=0, column=0, padx=(0, 8))
 
+        self.remove_file_button = ttk.Button(
+            top, text="Remove Selected", command=self.remove_selected_files
+        )
+        self.remove_file_button.grid(row=0, column=1, padx=(0, 8))
+
+        self.clear_files_button = ttk.Button(
+            top, text="Clear Files", command=self.clear_loaded_files
+        )
+        self.clear_files_button.grid(row=0, column=2, padx=(0, 8))
+
+        ttk.Separator(top, orient="vertical").grid(row=0, column=3, sticky="ns", padx=8)
+
+        mode_frame = ttk.Frame(top)
+        mode_frame.grid(row=0, column=4, sticky="w")
+
         self.crop_radio = ttk.Radiobutton(
-            top,
+            mode_frame,
             text="Polygon Crop",
             variable=self.mode_var,
             value="crop",
             command=self._on_mode_change,
         )
-        self.crop_radio.grid(row=0, column=1, padx=(0, 8))
+        self.crop_radio.grid(row=0, column=0, padx=(0, 8))
 
         self.split_radio = ttk.Radiobutton(
-            top,
+            mode_frame,
             text="Line Split",
             variable=self.mode_var,
             value="split",
             command=self._on_mode_change,
         )
-        self.split_radio.grid(row=0, column=2, padx=(0, 8))
+        self.split_radio.grid(row=0, column=1, padx=(0, 8))
 
         self.grid_radio = ttk.Radiobutton(
-            top,
+            mode_frame,
             text="Grid Split",
             variable=self.mode_var,
             value="grid",
             command=self._on_mode_change,
         )
-        self.grid_radio.grid(row=0, column=3, padx=(0, 8))
+        self.grid_radio.grid(row=0, column=2)
 
-        self.clear_selection_button = ttk.Button(
-            top, text="Clear Selection", command=self.clear_selection
+        self.cancel_button = ttk.Button(
+            top, text="Cancel", command=self.cancel_export, state="disabled"
         )
-        self.clear_selection_button.grid(row=0, column=4, padx=(0, 8))
+        self.cancel_button.grid(row=0, column=6, padx=(8, 8))
 
-        self.reset_view_button = ttk.Button(
-            top, text="Reset View", command=self.reset_view
+        self.export_button = ttk.Button(
+            top, text="Export", command=self.start_export, style="Primary.TButton"
         )
-        self.reset_view_button.grid(row=0, column=5, padx=(0, 8))
-
-        self.edl_check = ttk.Checkbutton(
-            top, text="Eye Dome Lighting", variable=self.edl_var, command=self._on_edl_toggle
-        )
-        self.edl_check.grid(row=0, column=6, padx=(0, 8))
-
-        self.remove_file_button = ttk.Button(
-            top, text="Remove Selected", command=self.remove_selected_files
-        )
-        self.remove_file_button.grid(row=0, column=7, padx=(0, 8))
-
-        self.clear_files_button = ttk.Button(
-            top, text="Clear Files", command=self.clear_loaded_files
-        )
-        self.clear_files_button.grid(row=0, column=8, padx=(0, 8))
-
-        self.export_button = ttk.Button(top, text="Export", command=self.start_export)
-        self.export_button.grid(row=0, column=9, padx=(0, 8))
-
-        ttk.Label(top, text="Current:").grid(row=0, column=10, padx=(16, 8), sticky="w")
-        ttk.Label(top, textvariable=self.file_var).grid(row=0, column=11, sticky="w")
+        self.export_button.grid(row=0, column=7)
 
         ttk.Label(top, textvariable=self.hint_var, foreground="#4f6b7a").grid(
             row=1,
             column=0,
-            columnspan=12,
+            columnspan=8,
             sticky="w",
             pady=(8, 0),
         )
 
         self.grid_controls = ttk.Frame(top)
-        self.grid_controls.grid(row=2, column=0, columnspan=12, sticky="w", pady=(10, 0))
+        self.grid_controls.grid(row=2, column=0, columnspan=8, sticky="w", pady=(10, 0))
 
         ttk.Label(self.grid_controls, text="Rows").grid(row=0, column=0, sticky="w")
         self.grid_rows_entry = ttk.Entry(self.grid_controls, textvariable=self.grid_rows_var, width=6)
@@ -615,10 +659,35 @@ class SplitCropPage(ttk.Frame, LogMixin):
         file_scroll.grid(row=0, column=1, sticky="ns")
         self.file_tree.configure(yscrollcommand=file_scroll.set)
 
+        ttk.Label(file_frame, textvariable=self.file_var, foreground="#4f6b7a").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+
         preview_frame = ttk.LabelFrame(self, text="Top View", padding=12)
         preview_frame.grid(row=2, column=0, sticky="nsew", padx=12)
         preview_frame.columnconfigure(0, weight=1)
-        preview_frame.rowconfigure(0, weight=1)
+        preview_frame.rowconfigure(1, weight=1)
+
+        view_bar = ttk.Frame(preview_frame)
+        view_bar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        view_bar.columnconfigure(3, weight=1)
+
+        self.clear_selection_button = ttk.Button(
+            view_bar, text="Clear Selection", command=self.clear_selection
+        )
+        self.clear_selection_button.grid(row=0, column=0, padx=(0, 8))
+
+        self.reset_view_button = ttk.Button(view_bar, text="Reset View", command=self.reset_view)
+        self.reset_view_button.grid(row=0, column=1, padx=(0, 8))
+
+        self.edl_check = ttk.Checkbutton(
+            view_bar, text="Eye Dome Lighting", variable=self.edl_var, command=self._on_edl_toggle
+        )
+        self.edl_check.grid(row=0, column=2, padx=(0, 8))
+
+        ttk.Label(view_bar, textvariable=self.coord_var, foreground="#4f6b7a").grid(
+            row=0, column=3, sticky="e"
+        )
 
         self.canvas = tk.Canvas(
             preview_frame,
@@ -626,8 +695,9 @@ class SplitCropPage(ttk.Frame, LogMixin):
             highlightthickness=1,
             highlightbackground="#d3dde5",
         )
-        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.canvas.grid(row=1, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<Leave>", lambda _event: self.coord_var.set(""))
         self.canvas.bind("<Motion>", self._on_canvas_motion)
         self.canvas.bind("<ButtonPress-1>", self._on_canvas_press)
         self.canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
@@ -655,8 +725,12 @@ class SplitCropPage(ttk.Frame, LogMixin):
         log_scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
+        ttk.Progressbar(self, variable=self.progress_var, maximum=100).grid(
+            row=4, column=0, sticky="ew", padx=12, pady=(0, 8)
+        )
+
         status_bar = ttk.Label(self, textvariable=self.status_var, anchor="w", relief="groove", padding=8)
-        status_bar.grid(row=4, column=0, sticky="ew")
+        status_bar.grid(row=5, column=0, sticky="ew")
 
         self.grid_rows_var.trace_add("write", self._on_grid_value_change)
         self.grid_cols_var.trace_add("write", self._on_grid_value_change)
@@ -900,11 +974,21 @@ class SplitCropPage(ttk.Frame, LogMixin):
             daemon=True,
         )
 
+        self.cancel_event.clear()
+        self.progress_var.set(0.0)
         self.processing = True
         self._set_controls_enabled(False)
         self.status_var.set("Exporting...")
         self.log(f"Starting {self._mode_label()} for {len(self.current_paths)} file(s).")
         worker.start()
+
+    def cancel_export(self) -> None:
+        if not self.processing or self.cancel_event.is_set():
+            return
+        self.cancel_event.set()
+        self.cancel_button.configure(state="disabled")
+        self.status_var.set("Cancelling... finishing the current chunk.")
+        self.log("Cancel requested. Unfinished outputs will be discarded.")
 
     def _export_worker(self, paths: list[Path], mode: str, selection: object) -> None:
         try:
@@ -944,12 +1028,17 @@ class SplitCropPage(ttk.Frame, LogMixin):
                 return progress
 
             def export_one(index: int, path: Path) -> tuple[int, object]:
-                result = self._export_single(
-                    path,
-                    mode,
-                    selection,
-                    make_progress_callback(path),
-                )
+                if self.cancel_event.is_set():
+                    return index, CancelledResult(path)
+                try:
+                    result = self._export_single(
+                        path,
+                        mode,
+                        selection,
+                        make_progress_callback(path),
+                    )
+                except OperationCancelled:
+                    return index, CancelledResult(path)
                 return index, result
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1012,12 +1101,18 @@ class SplitCropPage(ttk.Frame, LogMixin):
     ) -> object:
         if mode == "crop":
             assert isinstance(selection, PolygonSelection)
-            return crop_las(path, selection, progress_callback=progress)
+            return crop_las(
+                path, selection, progress_callback=progress, cancel_event=self.cancel_event
+            )
         if mode == "split":
             assert isinstance(selection, LineSelection)
-            return split_las(path, selection, progress_callback=progress)
+            return split_las(
+                path, selection, progress_callback=progress, cancel_event=self.cancel_event
+            )
         assert isinstance(selection, GridSelection)
-        return grid_split_las(path, selection, progress_callback=progress)
+        return grid_split_las(
+            path, selection, progress_callback=progress, cancel_event=self.cancel_event
+        )
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled else "disabled"
@@ -1038,6 +1133,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
             self.grid_2x4_button,
         ):
             widget.configure(state=state)
+        self.cancel_button.configure(state="normal" if self.processing else "disabled")
 
     def _drain_events(self) -> None:
         try:
@@ -1055,6 +1151,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
             total = payload["total"]
             done = payload["done"]
             if total:
+                self.progress_var.set(done / total * 100)
                 self.status_var.set(f"Loading preview {done / total * 100:.1f}%")
         elif event_name == "preview_loaded":
             assert isinstance(payload, dict)
@@ -1065,6 +1162,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
             self.current_paths = paths
             self.preview_data = preview
             self.loading_preview = False
+            self.progress_var.set(0.0)
             self._set_controls_enabled(True)
             self.view_zoom = 1.0
             self.view_pan_x = 0.0
@@ -1109,7 +1207,9 @@ class SplitCropPage(ttk.Frame, LogMixin):
             done = payload["done"]
             total = payload["total"]
             if total:
-                self.status_var.set(f"Exporting {done / total * 100:.1f}%")
+                self.progress_var.set(done / total * 100)
+                if not self.cancel_event.is_set():
+                    self.status_var.set(f"Exporting {done / total * 100:.1f}%")
         elif event_name == "export_file_complete":
             assert isinstance(payload, dict)
             result = payload["result"]
@@ -1123,6 +1223,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
             results = payload["results"]
             self.processing = False
             self._set_controls_enabled(True)
+            self.progress_var.set(0.0 if self.cancel_event.is_set() else 100.0)
             summary = self._summarize_results(results)
             self.status_var.set(f"{self._mode_label()} finished: {summary}")
             self.log(f"{self._mode_label()} finished: {summary}.")
@@ -1148,6 +1249,8 @@ class SplitCropPage(ttk.Frame, LogMixin):
 
     @staticmethod
     def _summarize_results(results: list) -> str:
+        cancelled = sum(1 for result in results if isinstance(result, CancelledResult))
+        results = [result for result in results if not isinstance(result, CancelledResult)]
         skipped = sum(1 for result in results if getattr(result, "skipped", False))
         empty = sum(
             1
@@ -1167,9 +1270,16 @@ class SplitCropPage(ttk.Frame, LogMixin):
             )
         )
         written = len(results) - skipped - empty
-        return f"{written} written, {skipped} skipped (output exists), {empty} produced no points"
+        summary = f"{written} written, {skipped} skipped (output exists), {empty} produced no points"
+        if cancelled:
+            summary += f", {cancelled} cancelled"
+        return summary
 
     def _log_export_result(self, result: object) -> None:
+        if isinstance(result, CancelledResult):
+            self.log(f"{result.input_path.name}: cancelled.")
+            return
+
         if isinstance(result, CropResult):
             if result.skipped:
                 self.log(f"{result.input_path.name}: {result.message}")
@@ -1335,6 +1445,11 @@ class SplitCropPage(ttk.Frame, LogMixin):
         self._draw_preview()
 
     def _on_canvas_motion(self, event) -> None:
+        if self.preview_data is not None and not self.loading_preview:
+            cursor = self._canvas_to_data(event.x, event.y)
+            if cursor is not None:
+                self.coord_var.set(f"X {cursor[0]:.3f}   Y {cursor[1]:.3f}")
+
         if (
             self.preview_data is None
             or self.loading_preview
@@ -1856,8 +1971,16 @@ class CloudTrimApp:
         root_class = TkinterDnD.Tk if HAS_DND else tk.Tk
         self.root = root_class()
         self.root.title("CloudTrim - Point Cloud Batch Processor")
+        icon_path = Path(__file__).resolve().parent / "assets" / "cloudtrim.ico"
+        try:
+            self.root.iconbitmap(default=str(icon_path))
+        except tk.TclError:
+            pass  # The icon is cosmetic; keep running without it.
         self.root.geometry("1180x820")
         self.root.minsize(900, 620)
+
+        style = ttk.Style(self.root)
+        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(18, 6))
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True)
