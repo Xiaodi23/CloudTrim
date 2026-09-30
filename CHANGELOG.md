@@ -1,6 +1,6 @@
 # Changelog / 更新日志
 
-## Unreleased / 未发布
+## 0.3.0 - 2026-09-30
 
 ### Added / 新增
 
