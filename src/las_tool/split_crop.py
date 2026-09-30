@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import copy
 import math
+import uuid
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -93,6 +94,7 @@ class PreviewData:
     bounds: Bounds2D
     preview_points: np.ndarray
     preview_colors: np.ndarray
+    preview_z: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float64))
 
 
 @dataclass
@@ -196,6 +198,7 @@ def load_preview_data(
         if total_points == 0:
             preview_points = np.empty((0, 2), dtype=np.float64)
             preview_colors = np.empty((0, 3), dtype=np.uint8)
+            preview_z = np.empty(0, dtype=np.float64)
             if progress_callback is not None:
                 progress_callback(0, 0)
             return PreviewData(
@@ -204,6 +207,7 @@ def load_preview_data(
                 bounds=bounds,
                 preview_points=preview_points,
                 preview_colors=preview_colors,
+                preview_z=preview_z,
             )
 
         step = max(1, math.ceil(total_points / max_points))
@@ -240,8 +244,9 @@ def load_preview_data(
             else np.empty((0, 3), dtype=np.float64)
         )
         preview_points = preview_xyz[:, :2]
+        preview_z = preview_xyz[:, 2] if preview_xyz.size else np.empty(0, dtype=np.float64)
         preview_colors = _resolve_preview_colors(
-            preview_xyz[:, 2] if preview_xyz.size else np.empty(0, dtype=np.float64),
+            preview_z,
             np.concatenate(rgb_samples, axis=0) if rgb_samples else None,
         )
 
@@ -251,6 +256,7 @@ def load_preview_data(
         bounds=bounds,
         preview_points=preview_points,
         preview_colors=preview_colors,
+        preview_z=preview_z,
     )
 
 
@@ -272,6 +278,7 @@ def combine_preview_data(
             bounds=preview.bounds,
             preview_points=preview.preview_points,
             preview_colors=preview.preview_colors,
+            preview_z=preview.preview_z,
         )
 
     total_points = sum(preview.total_points for preview in previews)
@@ -283,6 +290,11 @@ def combine_preview_data(
     )
     preview_points = np.concatenate([preview.preview_points for preview in previews], axis=0)
     preview_colors = np.concatenate([preview.preview_colors for preview in previews], axis=0)
+    preview_z = (
+        np.concatenate([preview.preview_z for preview in previews], axis=0)
+        if any(preview.preview_z.size for preview in previews)
+        else np.empty(0, dtype=np.float64)
+    )
 
     return PreviewData(
         input_path=label_path or previews[0].input_path,
@@ -290,6 +302,7 @@ def combine_preview_data(
         bounds=bounds,
         preview_points=preview_points,
         preview_colors=preview_colors,
+        preview_z=preview_z,
     )
 
 
@@ -371,6 +384,7 @@ def crop_las(
             message=f"Skipped because output already exists: {output_path.name}",
         )
 
+    temporaries: dict[Path, Path] = {}
     try:
         with laspy.open(path) as reader:
             total_points = int(reader.header.point_count)
@@ -406,8 +420,9 @@ def crop_las(
 
                     if mask.any():
                         if writer is None:
+                            temporaries[output_path] = _temporary_path(output_path)
                             writer = stack.enter_context(
-                                laspy.open(output_path, mode="w", header=header)
+                                laspy.open(temporaries[output_path], mode="w", header=header)
                             )
                         writer.write_points(points[mask])
                         kept_points += int(mask.sum())
@@ -415,6 +430,8 @@ def crop_las(
                     processed += point_count
                     if progress_callback is not None:
                         progress_callback(processed, total_points)
+
+            _commit_temporaries(temporaries)
 
             if kept_points == 0:
                 return CropResult(
@@ -433,8 +450,9 @@ def crop_las(
                 output_points=kept_points,
                 message=f"Cropped point cloud saved to {output_path.name}.",
             )
-    except Exception:
-        _remove_file_if_exists(output_path)
+    except BaseException:
+        for temporary_path in temporaries.values():
+            _remove_file_if_exists(temporary_path)
         raise
 
 
@@ -471,6 +489,7 @@ def split_las(
     dx = selection.x2 - selection.x1
     dy = selection.y2 - selection.y1
 
+    temporaries: dict[Path, Path] = {}
     try:
         with laspy.open(path) as reader:
             total_points = int(reader.header.point_count)
@@ -497,8 +516,11 @@ def split_las(
 
                     if left_mask.any():
                         if left_writer is None:
+                            temporaries[left_output_path] = _temporary_path(left_output_path)
                             left_writer = stack.enter_context(
-                                laspy.open(left_output_path, mode="w", header=left_header)
+                                laspy.open(
+                                    temporaries[left_output_path], mode="w", header=left_header
+                                )
                             )
                         selected_left = points[left_mask]
                         left_writer.write_points(selected_left)
@@ -506,8 +528,11 @@ def split_las(
 
                     if right_mask.any():
                         if right_writer is None:
+                            temporaries[right_output_path] = _temporary_path(right_output_path)
                             right_writer = stack.enter_context(
-                                laspy.open(right_output_path, mode="w", header=right_header)
+                                laspy.open(
+                                    temporaries[right_output_path], mode="w", header=right_header
+                                )
                             )
                         selected_right = points[right_mask]
                         right_writer.write_points(selected_right)
@@ -516,6 +541,8 @@ def split_las(
                     processed += point_count
                     if progress_callback is not None:
                         progress_callback(processed, total_points)
+
+            _commit_temporaries(temporaries)
 
             messages: list[str] = []
             if left_points:
@@ -538,9 +565,9 @@ def split_las(
                 empty_right=right_points == 0,
                 message=". ".join(messages) + ".",
             )
-    except Exception:
-        _remove_file_if_exists(left_output_path)
-        _remove_file_if_exists(right_output_path)
+    except BaseException:
+        for temporary_path in temporaries.values():
+            _remove_file_if_exists(temporary_path)
         raise
 
 
@@ -578,7 +605,7 @@ def grid_split_las(
         raise ValueError("Grid cell size must be greater than 0.")
 
     point_counts = [0] * selection.part_count
-    created_files: list[Path] = []
+    temporaries: dict[Path, Path] = {}
 
     try:
         with laspy.open(path) as reader:
@@ -627,11 +654,17 @@ def grid_split_las(
                             part_index = int(sorted_part_indices[start])
                             writer = writers[part_index]
                             if writer is None:
+                                temporaries[output_paths[part_index]] = _temporary_path(
+                                    output_paths[part_index]
+                                )
                                 writer = stack.enter_context(
-                                    laspy.open(output_paths[part_index], mode="w", header=headers[part_index])
+                                    laspy.open(
+                                        temporaries[output_paths[part_index]],
+                                        mode="w",
+                                        header=headers[part_index],
+                                    )
                                 )
                                 writers[part_index] = writer
-                                created_files.append(output_paths[part_index])
 
                             writer.write_points(selected_points[group])
                             point_counts[part_index] += int(group.size)
@@ -640,6 +673,8 @@ def grid_split_las(
                     processed += point_count
                     if progress_callback is not None:
                         progress_callback(processed, total_points)
+
+        _commit_temporaries(temporaries)
 
         parts = [
             GridPartResult(
@@ -660,9 +695,9 @@ def grid_split_las(
             parts=parts,
             message=message,
         )
-    except Exception:
-        for created_file in created_files:
-            _remove_file_if_exists(created_file)
+    except BaseException:
+        for temporary_path in temporaries.values():
+            _remove_file_if_exists(temporary_path)
         raise
 
 
@@ -755,6 +790,16 @@ def _format_grid_message(parts: list[GridPartResult]) -> str:
         else:
             messages.append(f"{label}: saved to {part.output_path.name} ({part.point_count:,} pts)")
     return ". ".join(messages) + "."
+
+
+def _temporary_path(output_path: Path) -> Path:
+    return output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex[:8]}.tmp")
+
+
+def _commit_temporaries(temporaries: dict[Path, Path]) -> None:
+    """Move finished temporary files to their final names."""
+    for output_path, temporary_path in temporaries.items():
+        temporary_path.replace(output_path)
 
 
 def _remove_file_if_exists(path: Path) -> None:
