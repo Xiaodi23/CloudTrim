@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import sys
 import tempfile
 import unittest
@@ -121,6 +122,35 @@ class DownsampleTests(unittest.TestCase):
             self.assertTrue(np.allclose(output.x, xs[expected_indices]))
             self.assertTrue(np.allclose(output.y, ys[expected_indices]))
             self.assertTrue(np.allclose(output.z, zs[expected_indices]))
+
+    def test_understated_header_bounds_do_not_drop_distinct_voxels(self) -> None:
+        rng = np.random.default_rng(7)
+        xs = rng.random(1000) * 100
+        ys = rng.random(1000) * 100
+        zs = rng.random(1000) * 10
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "bad_header.las"
+            _write_sample_las(input_path, xs, ys, zs)
+
+            # Overwrite max/min X, Y, Z in the header with a tiny box.
+            data = bytearray(input_path.read_bytes())
+            struct.pack_into("<6d", data, 179, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0)
+            input_path.write_bytes(bytes(data))
+
+            result = downsample_las(input_path, 0.5)
+
+            source = laspy.read(input_path)
+            expected = len(
+                set(
+                    zip(
+                        np.floor(np.asarray(source.x) / 0.5).tolist(),
+                        np.floor(np.asarray(source.y) / 0.5).tolist(),
+                        np.floor(np.asarray(source.z) / 0.5).tolist(),
+                    )
+                )
+            )
+            self.assertEqual(result.output_points, expected)
 
 
 if __name__ == "__main__":
