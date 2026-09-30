@@ -42,11 +42,20 @@ if (-not (Test-Path -LiteralPath $BuildEnvironment)) {
 }
 
 $BuildPython = Join-Path $BuildEnvironment "Scripts\python.exe"
-& $BuildPython -m pip install --upgrade pip
-& $BuildPython -m pip install -r requirements-dev.txt
-& $BuildPython -m unittest discover -s tests -v
+function Invoke-Checked {
+    param([scriptblock]$Command, [string]$Description)
+    & $Command
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Description failed with exit code $LASTEXITCODE"
+    }
+}
 
-& $BuildPython -m PyInstaller `
+Invoke-Checked { & $BuildPython -m pip install --upgrade pip } "Upgrading pip"
+# Some lazrs releases ship no wheel for older Python versions; never compile it from source.
+Invoke-Checked { & $BuildPython -m pip install --only-binary lazrs -r requirements-dev.txt } "Installing dependencies"
+Invoke-Checked { & $BuildPython -m unittest discover -s tests -v } "Running tests"
+
+Invoke-Checked { & $BuildPython -m PyInstaller `
     --noconfirm `
     --clean `
     --windowed `
@@ -57,6 +66,7 @@ $BuildPython = Join-Path $BuildEnvironment "Scripts\python.exe"
     --paths (Join-Path $ProjectRoot "src") `
     --specpath $BuildDirectory `
     --collect-all tkinterdnd2 `
+    --collect-all lazrs `
     --exclude-module matplotlib `
     --exclude-module pandas `
     --exclude-module scipy `
@@ -64,7 +74,7 @@ $BuildPython = Join-Path $BuildEnvironment "Scripts\python.exe"
     --exclude-module pyproj `
     --exclude-module torch `
     --exclude-module tensorflow `
-    main.py
+    main.py } "Building the executable"
 
 if (-not (Test-Path -LiteralPath $ExecutablePath -PathType Leaf)) {
     throw "Build did not produce the expected executable: $ExecutablePath"
