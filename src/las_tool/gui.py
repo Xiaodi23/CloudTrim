@@ -426,8 +426,14 @@ class DownsamplePage(ttk.Frame, LogMixin):
         elif event_name == "done":
             self.processing = False
             self._set_controls_enabled(True)
-            self.status_var.set("All files completed")
-            self.log("Batch processing completed.")
+            statuses = [self.tree.set(item_id, "status") for item_id in self.tree.get_children()]
+            summary = (
+                f"{statuses.count('Completed')} completed, "
+                f"{statuses.count('Skipped')} skipped, "
+                f"{statuses.count('Failed')} failed"
+            )
+            self.status_var.set(f"Finished: {summary}")
+            self.log(f"Batch processing finished: {summary}.")
 
 
 class SplitCropPage(ttk.Frame, LogMixin):
@@ -463,8 +469,16 @@ class SplitCropPage(ttk.Frame, LogMixin):
         self.split_points: list[tuple[float, float]] = []
 
         self.preview_photo: tk.PhotoImage | None = None
-        self.preview_cache_key: tuple[int, int, int] | None = None
+        self.preview_cache_key: tuple[int, int, int, float, float, float, bool] | None = None
         self.transform: dict[str, float] | None = None
+
+        self.view_zoom: float = 1.0
+        self.view_pan_x: float = 0.0
+        self.view_pan_y: float = 0.0
+        self.pan_start_x: float | None = None
+        self.pan_start_y: float | None = None
+        self.panning: bool = False
+        self.edl_var = tk.BooleanVar(value=True)
 
         self._build_layout()
         self._configure_drop()
@@ -478,7 +492,7 @@ class SplitCropPage(ttk.Frame, LogMixin):
 
         top = ttk.Frame(self, padding=12)
         top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(9, weight=1)
+        top.columnconfigure(11, weight=1)
 
         self.open_button = ttk.Button(top, text="Open LAS", command=self.open_file)
         self.open_button.grid(row=0, column=0, padx=(0, 8))
@@ -515,32 +529,42 @@ class SplitCropPage(ttk.Frame, LogMixin):
         )
         self.clear_selection_button.grid(row=0, column=4, padx=(0, 8))
 
+        self.reset_view_button = ttk.Button(
+            top, text="Reset View", command=self.reset_view
+        )
+        self.reset_view_button.grid(row=0, column=5, padx=(0, 8))
+
+        self.edl_check = ttk.Checkbutton(
+            top, text="Eye Dome Lighting", variable=self.edl_var, command=self._on_edl_toggle
+        )
+        self.edl_check.grid(row=0, column=6, padx=(0, 8))
+
         self.remove_file_button = ttk.Button(
             top, text="Remove Selected", command=self.remove_selected_files
         )
-        self.remove_file_button.grid(row=0, column=5, padx=(0, 8))
+        self.remove_file_button.grid(row=0, column=7, padx=(0, 8))
 
         self.clear_files_button = ttk.Button(
             top, text="Clear Files", command=self.clear_loaded_files
         )
-        self.clear_files_button.grid(row=0, column=6, padx=(0, 8))
+        self.clear_files_button.grid(row=0, column=8, padx=(0, 8))
 
         self.export_button = ttk.Button(top, text="Export", command=self.start_export)
-        self.export_button.grid(row=0, column=7, padx=(0, 8))
+        self.export_button.grid(row=0, column=9, padx=(0, 8))
 
-        ttk.Label(top, text="Current:").grid(row=0, column=8, padx=(16, 8), sticky="w")
-        ttk.Label(top, textvariable=self.file_var).grid(row=0, column=9, sticky="w")
+        ttk.Label(top, text="Current:").grid(row=0, column=10, padx=(16, 8), sticky="w")
+        ttk.Label(top, textvariable=self.file_var).grid(row=0, column=11, sticky="w")
 
         ttk.Label(top, textvariable=self.hint_var, foreground="#4f6b7a").grid(
             row=1,
             column=0,
-            columnspan=10,
+            columnspan=12,
             sticky="w",
             pady=(8, 0),
         )
 
         self.grid_controls = ttk.Frame(top)
-        self.grid_controls.grid(row=2, column=0, columnspan=10, sticky="w", pady=(10, 0))
+        self.grid_controls.grid(row=2, column=0, columnspan=12, sticky="w", pady=(10, 0))
 
         ttk.Label(self.grid_controls, text="Rows").grid(row=0, column=0, sticky="w")
         self.grid_rows_entry = ttk.Entry(self.grid_controls, textvariable=self.grid_rows_var, width=6)
@@ -609,6 +633,15 @@ class SplitCropPage(ttk.Frame, LogMixin):
         self.canvas.bind("<Double-Button-1>", self._on_canvas_double_click)
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        self.canvas.bind("<MouseWheel>", self._on_canvas_wheel)
+        self.canvas.bind("<Button-4>", self._on_canvas_wheel)
+        self.canvas.bind("<Button-5>", self._on_canvas_wheel)
+        self.canvas.bind("<ButtonPress-2>", self._on_canvas_pan_start)
+        self.canvas.bind("<B2-Motion>", self._on_canvas_pan_move)
+        self.canvas.bind("<ButtonRelease-2>", self._on_canvas_pan_end)
+        self.canvas.bind("<ButtonPress-3>", self._on_canvas_pan_start)
+        self.canvas.bind("<B3-Motion>", self._on_canvas_pan_move)
+        self.canvas.bind("<ButtonRelease-3>", self._on_canvas_pan_end)
 
         log_frame = ttk.LabelFrame(self, text="Activity Log", padding=12)
         log_frame.grid(row=3, column=0, sticky="nsew", padx=12, pady=12)
@@ -813,6 +846,9 @@ class SplitCropPage(ttk.Frame, LogMixin):
         self.drag_anchor = None
         self.drag_point = None
         self.drag_mode = None
+        self.view_zoom = 1.0
+        self.view_pan_x = 0.0
+        self.view_pan_y = 0.0
         self.file_var.set("No files loaded")
         self._sync_file_tree([])
         self._invalidate_preview_cache()
@@ -991,6 +1027,8 @@ class SplitCropPage(ttk.Frame, LogMixin):
             self.split_radio,
             self.grid_radio,
             self.clear_selection_button,
+            self.reset_view_button,
+            self.edl_check,
             self.remove_file_button,
             self.clear_files_button,
             self.export_button,
@@ -1028,6 +1066,9 @@ class SplitCropPage(ttk.Frame, LogMixin):
             self.preview_data = preview
             self.loading_preview = False
             self._set_controls_enabled(True)
+            self.view_zoom = 1.0
+            self.view_pan_x = 0.0
+            self.view_pan_y = 0.0
             self._invalidate_preview_cache()
             self.crop_selection = None
             self.crop_points = []
@@ -1082,7 +1123,9 @@ class SplitCropPage(ttk.Frame, LogMixin):
             results = payload["results"]
             self.processing = False
             self._set_controls_enabled(True)
-            self.status_var.set(f"{self._mode_label()} completed for {len(results)} file(s)")
+            summary = self._summarize_results(results)
+            self.status_var.set(f"{self._mode_label()} finished: {summary}")
+            self.log(f"{self._mode_label()} finished: {summary}.")
             if mode == "grid":
                 written = 0
                 empty = 0
@@ -1102,6 +1145,29 @@ class SplitCropPage(ttk.Frame, LogMixin):
             self.log(f"Export failed: {exc}")
             self.log(detail)
             messagebox.showerror("Export Error", str(exc), parent=self)
+
+    @staticmethod
+    def _summarize_results(results: list) -> str:
+        skipped = sum(1 for result in results if getattr(result, "skipped", False))
+        empty = sum(
+            1
+            for result in results
+            if not getattr(result, "skipped", False)
+            and (
+                getattr(result, "empty", False)
+                or (
+                    isinstance(result, SplitResult)
+                    and result.empty_left
+                    and result.empty_right
+                )
+                or (
+                    isinstance(result, GridSplitResult)
+                    and all(part.empty for part in result.parts)
+                )
+            )
+        )
+        written = len(results) - skipped - empty
+        return f"{written} written, {skipped} skipped (output exists), {empty} produced no points"
 
     def _log_export_result(self, result: object) -> None:
         if isinstance(result, CropResult):
@@ -1138,8 +1204,8 @@ class SplitCropPage(ttk.Frame, LogMixin):
         mode = self.mode_var.get()
         if mode == "crop":
             self.hint_var.set(
-                "Polygon crop: click to add vertices, then double-click or click the first "
-                "vertex to close the polygon."
+                "Polygon crop: click to add vertices, double-click or click start to close. "
+                "Scroll wheel to zoom, right-drag to pan."
             )
             if self.crop_selection is None:
                 if self.crop_points:
@@ -1150,8 +1216,8 @@ class SplitCropPage(ttk.Frame, LogMixin):
                 self.status_var.set("Polygon selection ready. Click Export to continue.")
         elif mode == "split":
             self.hint_var.set(
-                "Line split: click two points to define the line. Left and right follow "
-                "the direction from the first point to the second."
+                "Line split: click two points to define the line. "
+                "Scroll wheel to zoom, right-drag to pan."
             )
             if not self.split_points:
                 self.status_var.set("Line split: click the first point.")
@@ -1163,7 +1229,8 @@ class SplitCropPage(ttk.Frame, LogMixin):
             rows, cols = self._safe_grid_shape()
             label = f"{rows} x {cols}" if rows is not None and cols is not None else "current settings"
             self.hint_var.set(
-                "Grid split: use the full point-cloud bounds or drag a rectangle to limit the area."
+                "Grid split: full bounds or drag rectangle. "
+                "Scroll wheel to zoom, right-drag to pan."
             )
             if self.preview_data is None:
                 self.status_var.set("Grid split: load files to preview and export partitions.")
@@ -1186,6 +1253,82 @@ class SplitCropPage(ttk.Frame, LogMixin):
         if self.mode_var.get() == "grid":
             self._update_mode_hint()
             self._draw_preview()
+
+    def reset_view(self) -> None:
+        if self.loading_preview or self.processing:
+            return
+        self.view_zoom = 1.0
+        self.view_pan_x = 0.0
+        self.view_pan_y = 0.0
+        self._invalidate_preview_cache()
+        self._draw_preview()
+
+    def _on_edl_toggle(self) -> None:
+        self._invalidate_preview_cache()
+        self._draw_preview()
+
+    def _on_canvas_wheel(self, event) -> None:
+        if self.preview_data is None or self.loading_preview or self.processing:
+            return
+        if self.transform is None:
+            return
+
+        if hasattr(event, "delta") and event.delta != 0:
+            zoom_in = event.delta > 0
+        elif getattr(event, "num", None) == 4:
+            zoom_in = True
+        elif getattr(event, "num", None) == 5:
+            zoom_in = False
+        else:
+            return
+
+        factor = 1.15 if zoom_in else (1.0 / 1.15)
+        new_zoom = float(np.clip(self.view_zoom * factor, 0.1, 100.0))
+        actual_factor = new_zoom / self.view_zoom
+        if abs(actual_factor - 1.0) < 1e-4:
+            return
+
+        cx = float(event.x)
+        cy = float(event.y)
+
+        eff_left = self.transform["plot_left"]
+        eff_top = self.transform["plot_top"]
+        base_left = self.transform["base_left"]
+        base_top = self.transform["base_top"]
+
+        new_eff_left = cx - (cx - eff_left) * actual_factor
+        new_eff_top = cy - (cy - eff_top) * actual_factor
+
+        self.view_zoom = new_zoom
+        self.view_pan_x = float(new_eff_left - base_left)
+        self.view_pan_y = float(new_eff_top - base_top)
+
+        self._invalidate_preview_cache()
+        self._draw_preview()
+
+    def _on_canvas_pan_start(self, event) -> None:
+        if self.preview_data is None or self.loading_preview or self.processing:
+            return
+        self.pan_start_x = float(event.x)
+        self.pan_start_y = float(event.y)
+        self.panning = True
+
+    def _on_canvas_pan_move(self, event) -> None:
+        if not self.panning or self.pan_start_x is None or self.pan_start_y is None:
+            return
+        dx = float(event.x) - self.pan_start_x
+        dy = float(event.y) - self.pan_start_y
+        self.pan_start_x = float(event.x)
+        self.pan_start_y = float(event.y)
+        self.view_pan_x += dx
+        self.view_pan_y += dy
+        self._invalidate_preview_cache()
+        self._draw_preview()
+
+    def _on_canvas_pan_end(self, _event) -> None:
+        self.panning = False
+        self.pan_start_x = None
+        self.pan_start_y = None
 
     def _on_canvas_configure(self, _event) -> None:
         self._invalidate_preview_cache()
@@ -1380,7 +1523,15 @@ class SplitCropPage(ttk.Frame, LogMixin):
             )
             return
 
-        cache_key = (id(self.preview_data), width, height)
+        cache_key = (
+            id(self.preview_data),
+            width,
+            height,
+            round(self.view_zoom, 4),
+            round(self.view_pan_x, 1),
+            round(self.view_pan_y, 1),
+            self.edl_var.get(),
+        )
         if self.preview_cache_key != cache_key:
             self.transform = self._compute_transform(width, height, self.preview_data.bounds)
             self.preview_photo = self._build_preview_image(width, height)
@@ -1401,11 +1552,15 @@ class SplitCropPage(ttk.Frame, LogMixin):
         data_height = max(bounds.max_y - bounds.min_y, 1e-9)
         plot_width = max(width - self.PREVIEW_PADDING * 2, 1)
         plot_height = max(height - self.PREVIEW_PADDING * 2, 1)
-        scale = min(plot_width / data_width, plot_height / data_height)
-        used_width = data_width * scale
-        used_height = data_height * scale
-        plot_left = (width - used_width) / 2
-        plot_top = (height - used_height) / 2
+        base_scale = min(plot_width / data_width, plot_height / data_height)
+        used_width = data_width * base_scale
+        used_height = data_height * base_scale
+        base_left = (width - used_width) / 2
+        base_top = (height - used_height) / 2
+
+        scale = base_scale * self.view_zoom
+        plot_left = base_left + self.view_pan_x
+        plot_top = base_top + self.view_pan_y
 
         return {
             "min_x": bounds.min_x,
@@ -1415,6 +1570,9 @@ class SplitCropPage(ttk.Frame, LogMixin):
             "plot_top": plot_top,
             "max_x": bounds.max_x,
             "min_y": bounds.min_y,
+            "base_scale": base_scale,
+            "base_left": base_left,
+            "base_top": base_top,
         }
 
     def _build_preview_image(self, width: int, height: int) -> tk.PhotoImage:
@@ -1426,20 +1584,85 @@ class SplitCropPage(ttk.Frame, LogMixin):
 
         points = self.preview_data.preview_points
         colors = self.preview_data.preview_colors
+        z_vals = getattr(self.preview_data, "preview_z", None)
+        enable_edl = (
+            self.edl_var.get()
+            and z_vals is not None
+            and len(z_vals) == len(points)
+            and len(points) > 0
+        )
+
         if points.size:
             xs, ys = self._data_to_canvas_arrays(points[:, 0], points[:, 1])
-            xi = np.clip(np.rint(xs).astype(np.int64), 0, width - 1)
-            yi = np.clip(np.rint(ys).astype(np.int64), 0, height - 1)
-            image[yi, xi] = colors
+            visible = (xs >= -1) & (xs < width) & (ys >= -1) & (ys < height)
+            if np.any(visible):
+                xi = np.rint(xs[visible]).astype(np.int64)
+                yi = np.rint(ys[visible]).astype(np.int64)
+                cols = colors[visible]
 
-            for dx, dy in ((1, 0), (0, 1), (1, 1)):
-                nx = np.clip(xi + dx, 0, width - 1)
-                ny = np.clip(yi + dy, 0, height - 1)
-                image[ny, nx] = colors
+                if enable_edl:
+                    zv = z_vals[visible]
+                    order = np.argsort(zv)
+                    xi = xi[order]
+                    yi = yi[order]
+                    cols = cols[order]
+                    zv = zv[order]
+                    z_buffer = np.full((height, width), -1e9, dtype=np.float32)
+
+                for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                    cx = xi + dx
+                    cy = yi + dy
+                    in_bounds = (cx >= 0) & (cx < width) & (cy >= 0) & (cy < height)
+                    bx = cx[in_bounds]
+                    by = cy[in_bounds]
+                    image[by, bx] = cols[in_bounds]
+                    if enable_edl:
+                        z_buffer[by, bx] = zv[in_bounds]
+
+                if enable_edl:
+                    self._apply_edl_shading(image, z_buffer, width, height)
 
         ppm_header = f"P6 {width} {height} 255\n".encode("ascii")
         ppm_bytes = ppm_header + image.tobytes()
         return tk.PhotoImage(data=ppm_bytes, format="PPM")
+
+    @staticmethod
+    def _apply_edl_shading(
+        image: np.ndarray,
+        z_buffer: np.ndarray,
+        width: int,
+        height: int,
+    ) -> None:
+        valid_mask = z_buffer > -1e8
+        if not np.any(valid_mask):
+            return
+
+        valid_z = z_buffer[valid_mask]
+        z_min = float(np.min(valid_z))
+        z_max = float(np.max(valid_z))
+        z_range = max(z_max - z_min, 1e-6)
+
+        depth = np.ones((height, width), dtype=np.float32)
+        depth[valid_mask] = (z_max - valid_z) / z_range
+
+        d_pad = np.pad(depth, 1, mode="edge")
+        dc = d_pad[1:-1, 1:-1]
+
+        response = np.zeros((height, width), dtype=np.float32)
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            dn = d_pad[1 + dy : 1 + dy + height, 1 + dx : 1 + dx + width]
+            diff = np.maximum(0.0, dn - dc)
+            diff += np.maximum(0.0, dc - dn) * 0.25
+            response += diff
+
+        edl_strength = 8.0
+        shade = np.exp(-response * edl_strength)
+        np.clip(shade, 0.25, 1.0, out=shade)
+
+        shade_u16 = (shade[valid_mask, None] * 256).astype(np.uint16)
+        image[valid_mask] = (
+            (image[valid_mask].astype(np.uint16) * shade_u16) >> 8
+        ).astype(np.uint8)
 
     def _draw_overlays(self) -> None:
         mode = self.mode_var.get()
