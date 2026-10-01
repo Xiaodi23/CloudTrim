@@ -15,9 +15,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from las_tool import formats
-from las_tool.downsample import downsample_las
-from las_tool.split_crop import (
+from cloudtrim import formats
+from cloudtrim.downsample import downsample_las
+from cloudtrim.split_crop import (
     Bounds2D,
     GridSelection,
     LineSelection,

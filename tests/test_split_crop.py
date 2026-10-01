@@ -16,9 +16,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from las_tool.cancellation import OperationCancelled
-from las_tool.downsample import downsample_las
-from las_tool.split_crop import (
+from cloudtrim.cancellation import OperationCancelled
+from cloudtrim.downsample import downsample_las
+from cloudtrim.split_crop import (
     Bounds2D,
     GridSelection,
     LineSelection,
@@ -322,7 +322,7 @@ class SplitCropTests(unittest.TestCase):
             np.testing.assert_allclose(combined.preview_z, [1.0, 2.0, 3.0, 4.0])
 
     def test_apply_edl_shading_darkens_boundaries(self) -> None:
-        from las_tool.gui import SplitCropPage
+        from cloudtrim.gui import SplitCropPage
 
         H, W = 40, 40
         image = np.full((H, W, 3), 200, dtype=np.uint8)
@@ -341,7 +341,7 @@ class SplitCropTests(unittest.TestCase):
         self.assertLess(edge_val, center_val)
 
     def test_canvas_zoom_preserves_cursor_data_point(self) -> None:
-        from las_tool.gui import SplitCropPage
+        from cloudtrim.gui import SplitCropPage
 
         bounds = Bounds2D(min_x=100.0, max_x=200.0, min_y=50.0, max_y=150.0)
         width, height = 800, 600

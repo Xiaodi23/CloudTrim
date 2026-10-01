@@ -15,7 +15,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from las_tool.downsample import (
+from cloudtrim.downsample import (
     _select_new_voxels,
     _unique_first_indices,
     build_output_path,

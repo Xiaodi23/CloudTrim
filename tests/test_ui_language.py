@@ -7,9 +7,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 APPLICATION_FILES = (
-    ROOT / "src" / "las_tool" / "gui.py",
-    ROOT / "src" / "las_tool" / "downsample.py",
-    ROOT / "src" / "las_tool" / "split_crop.py",
+    ROOT / "src" / "cloudtrim" / "gui.py",
+    ROOT / "src" / "cloudtrim" / "downsample.py",
+    ROOT / "src" / "cloudtrim" / "split_crop.py",
 )
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
